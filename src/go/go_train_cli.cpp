@@ -63,6 +63,8 @@ struct TrainOptions {
     Scalar lr = 1.0e-3F;
     Scalar min_lr = 1.0e-5F;
     Scalar weight_decay = 1.0e-4F;
+    // M7: 价值头损失权重（GoLoss). 0 = 只训策略头；1 = 与策略 CE 等权。
+    Scalar value_weight = 1.0F;
     Scalar beta1 = 0.9F;
     Scalar beta2 = 0.999F;
     Scalar clip_grad_norm = 1.0F;
@@ -185,6 +187,8 @@ TrainOptions parse_train_options(int argc, char** argv) {
             options.min_lr = std::stof(option_value(i, argc, argv));
         } else if (arg == "--weight-decay") {
             options.weight_decay = std::stof(option_value(i, argc, argv));
+        } else if (arg == "--value-weight") {
+            options.value_weight = std::stof(option_value(i, argc, argv));
         } else if (arg == "--beta1") {
             options.beta1 = std::stof(option_value(i, argc, argv));
         } else if (arg == "--beta2") {
@@ -245,6 +249,9 @@ TrainOptions parse_train_options(int argc, char** argv) {
     }
     if (options.clip_grad_norm < 0) {
         throw std::invalid_argument("clip-grad-norm must be non-negative");
+    }
+    if (options.value_weight < 0) {
+        throw std::invalid_argument("value-weight must be non-negative");
     }
     if (options.warmup_epochs < 0 || options.warmup_epochs >= options.epochs) {
         throw std::invalid_argument("warmup-epochs must be in [0, epochs)");
@@ -415,7 +422,8 @@ EvalMetrics evaluate(
     go::FeatureCache& cache,
     std::size_t batch_size,
     std::size_t maximum,
-    std::size_t history_len = 0
+    std::size_t history_len = 0,
+    Scalar value_weight = Scalar{1}
 ) {
     const auto started = std::chrono::steady_clock::now();
     const std::vector<std::size_t> indices = sample_indices(cache, maximum);
@@ -424,7 +432,7 @@ EvalMetrics evaluate(
     }
     nn::ComputeEngine& engine = model.engine();
     nn::CrossEntropyLoss loss_fn;
-    go::GoLoss go_loss;
+    go::GoLoss go_loss(value_weight);
     model.set_training(false);
 
     Scalar loss_sum = 0;
@@ -893,7 +901,8 @@ int train(const TrainOptions& options) {
     model->set_training(true);
 
     const EvalMetrics initial_eval = evaluate(
-        *model, eval_cache, options.common.batch_size, 0, history_len
+        *model, eval_cache, options.common.batch_size, 0, history_len,
+        options.value_weight
     );
     model->set_training(true);
 
@@ -908,7 +917,8 @@ int train(const TrainOptions& options) {
         : options.epochs;
     if (planned_final_epoch > start_epoch) {
         first_train_loss = evaluate(
-            *model, train_cache, options.common.batch_size, 0, history_len
+            *model, train_cache, options.common.batch_size, 0, history_len,
+            options.value_weight
         ).loss;
         model->set_training(true);
     }
@@ -925,7 +935,7 @@ int train(const TrainOptions& options) {
         nn::TrainingSession::create(std::move(*model), training_config)
     );
     nn::CrossEntropyLoss loss_fn;
-    go::GoLoss go_loss;
+    go::GoLoss go_loss(options.value_weight);
 
     if (resumed) {
         // 优化器身份已由状态段决定；张量数量/形状对不上由 load_state 硬错。
@@ -1068,7 +1078,8 @@ int train(const TrainOptions& options) {
         const Scalar mean_loss = loss_sum / static_cast<Scalar>(seen);
         final_train_loss = mean_loss;
         const EvalMetrics eval = evaluate(
-            session.model(), eval_cache, options.common.batch_size, 0, history_len
+            session.model(), eval_cache, options.common.batch_size, 0, history_len,
+            options.value_weight
         );
         final_eval = eval;
         session.model().set_training(true);
@@ -1360,7 +1371,7 @@ void usage(const char* program) {
         << "  " << program << " train --dataset FILE.ngf --eval-dataset FILE.ngf"
         << " [--gpu=40HX] [--epochs 4] [--batch-size 64] [--arch b|c]\n"
         << "       [--d-model 192] [--num-layers 8] [--num-heads 8] [--d-ff 768]"
-        << " [--conv-channels 64] [--history-len 64]\n"
+        << " [--conv-channels 64] [--history-len 64] [--value-weight 1.0]\n"
         << "       [--optimizer adamw] [--schedule cosine] [--lr 0.001]"
         << " [--min-lr 0.00001] [--weight-decay 0.0001]\n"
         << "       [--beta1 0.9] [--beta2 0.999] [--clip-grad-norm 1.0]"
