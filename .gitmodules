@@ -1,0 +1,6 @@
+[submodule "3rd_party/neuralnet.cpp"]
+	path = 3rd_party/neuralnet.cpp
+	url = https://github.com/EthanPeng-2048/neuralnet.cpp.git
+[submodule "3rd_party/KataGo"]
+	path = 3rd_party/KataGo
+	url = https://github.com/lightvector/KataGo.git

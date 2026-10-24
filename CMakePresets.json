@@ -1,0 +1,62 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 30,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "cpu",
+      "displayName": "CPU Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/cpu",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GO_ENABLE_GPU": "OFF",
+        "GO_BUILD_UPSTREAM_TOOLS": "ON",
+        "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "gpu",
+      "displayName": "Vulkan Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/gpu",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GO_ENABLE_GPU": "ON",
+        "GO_BUILD_UPSTREAM_TOOLS": "ON",
+        "BUILD_TESTING": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "cpu",
+      "configurePreset": "cpu",
+      "targets": ["go_neuralnet_m0", "layer_bench", "go_rules_cli", "go_rules_tests", "go_data_cli"]
+    },
+    {
+      "name": "gpu",
+      "configurePreset": "gpu",
+      "targets": ["go_neuralnet_m0", "layer_bench", "go_rules_cli", "go_rules_tests", "go_data_cli"]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "cpu",
+      "configurePreset": "cpu",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "gpu",
+      "configurePreset": "gpu",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

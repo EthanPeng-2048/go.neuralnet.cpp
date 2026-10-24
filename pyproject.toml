@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "go-neuralnet-pipeline"
+version = "0.1.0"
+description = "Batch SGF, nngames, tokenizer, and feature pipeline for go.neuralnet.cpp"
+readme = "README.md"
+license = "LGPL-3.0-only"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "EthanPeng-2048" }]
+dependencies = [
+    "httpx==0.28.1",
+    "numpy==2.5.4",
+    "orjson==3.13.0",
+    "Pillow==13.0.0",
+    "sgfmill==1.1.1",
+    "tenacity==9.2.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/EthanPeng-2048/go.neuralnet.cpp"
+Issues = "https://github.com/EthanPeng-2048/go.neuralnet.cpp/issues"
+Documentation = "https://github.com/EthanPeng-2048/go.neuralnet.cpp/tree/main/docs"
+
+[project.scripts]
+go-pipeline = "go_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["python"]

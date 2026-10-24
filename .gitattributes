@@ -1,0 +1,9 @@
+* text=auto eol=lf
+
+*.png binary
+*.npy binary
+*.nngames binary
+*.nnvocab binary
+*.nnckpt binary
+*.nnmodel binary
+*.nnpkg binary
