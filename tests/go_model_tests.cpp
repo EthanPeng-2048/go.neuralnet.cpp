@@ -158,8 +158,9 @@ void test_forward_backward() {
     // 参数梯度必须全部有限（NaN 会静默毁掉整个训练）。
     auto gradients = model.param_gradients();
     require(!gradients.empty(), "model has parameters");
-    for (nn::TensorRef reference : gradients) {
-        nn::Tensor& tensor = reference.get();
+    std::vector<bool> touches(gradients.size(), false);
+    for (std::size_t index = 0; index < gradients.size(); ++index) {
+        nn::Tensor& tensor = gradients[index].get();
         std::vector<nn::Scalar> buffer(tensor.size(), nn::Scalar{0});
         NN_UNWRAP(engine->read(tensor, std::span<nn::Scalar>(buffer)));
         for (nn::Scalar g : buffer) {
@@ -167,6 +168,20 @@ void test_forward_backward() {
                 require(false, "parameter gradient is not finite");
                 return;
             }
+            if (g != nn::Scalar{0}) {
+                touches[index] = true;
+            }
+        }
+    }
+    // parameters() 的前四个是自身参数：history / position / segment / query
+    // 四张表。它们必须真的拿到梯度，否则"历史分支"只是形状上的装饰
+    // （例如历史 id 被全 pad 覆盖、或查询行取错位置时，前向仍然跑得通）。
+    require(gradients.size() >= 4, "embedding tables are parameters");
+    const char* names[] = {"history", "position", "segment", "query"};
+    for (std::size_t i = 0; i < 4; ++i) {
+        if (!touches[i]) {
+            std::fprintf(stderr, "FAIL: %s embedding has zero gradient\n", names[i]);
+            ++failures;
         }
     }
 }
