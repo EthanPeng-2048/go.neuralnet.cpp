@@ -107,9 +107,17 @@ def _dataset_game_count(data_cli: Path, dataset: Path) -> int:
 
 
 def _value_for_result(outcome: str, to_move: str) -> int:
+    """Outcome from the side-to-move's perspective: +1 win, -1 loss, 0 unknown.
+
+    `outcome` is the game result ("black" / "white" / "draw"), `to_move` is the
+    M2 colour tag ("b" / "w"). Comparing them directly would make every label
+    -1 — the value head would then train on a constant target and only surface
+    as "value AUC = 0" much later.
+    """
     if outcome == "draw" or outcome == "unknown":
         return 0
-    return 1 if outcome == to_move else -1
+    side = "black" if to_move == "b" else "white"
+    return 1 if outcome == side else -1
 
 
 def _point_token(token: int) -> int:

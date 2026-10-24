@@ -27,6 +27,7 @@
 
 #include "external/nlohmann_json/json.hpp"
 #include "go/feature_cache.hpp"
+#include "go/go_model.hpp"
 
 namespace {
 
@@ -40,32 +41,6 @@ struct CommonOptions {
     std::size_t max_samples = 0;
 };
 
-// B 架构（M7）的尺寸参数。模型本身正在按 dsl::compute 重写，这里只保留
-// CLI 表面积与校验；构建入口见 build_model_from_spec。
-struct BModelOptions {
-    std::size_t d_model = 192;
-    std::size_t num_layers = 8;
-    std::size_t num_heads = 8;
-    std::size_t d_ff = 768;
-    std::size_t conv_channels = 64;
-    std::size_t history_len = 64;
-};
-
-// 模型构建入口。M7 的 B 架构（双分支编码器 + decision query + 策略/价值
-// 双头 + GoLoss + 合法性掩码）正在重写；在它落地前，任何构建请求都必须
-// 显式失败，而不是退回手拼原语的旧实现。
-[[noreturn]] nn::Model build_model_from_spec(
-    nn::ComputeEngine& engine,
-    const nn::ModelSpec& spec
-) {
-    (void)engine;
-    (void)spec;
-    throw std::runtime_error(
-        "模型构建未实现：M7 的 B 架构正在重写（dsl::compute + AOT 融合），"
-        "重写落地后恢复 train/make-model/evaluate/续训"
-    );
-}
-
 // M5 监督配方：全部可经 CLI 表达，且逐项随断点落盘（TrainState::recipe），
 // 续训时以断点为权威。
 struct TrainOptions {
@@ -77,10 +52,10 @@ struct TrainOptions {
     std::string metrics_out = "artifacts/m4/c-validator.json";
     std::string metrics_log;   // 空 = 从 metrics_out 派生（.json → .jsonl）
     std::string resume;        // 非空 = 从 .nnckpt 断点续训
-    // M7：架构选择。b = B 双分支编码器（默认，主线）；c = M4 CNN 验证器。
-    // 两者都在等 B 重写落地，见 build_model_from_spec。
+    // M7：架构选择。b = B 双分支编码器（默认，主线）；c = M4 CNN 验证器
+    // （保留用于 B vs C 对照与 M5 语义回归）。续训时以断点 spec 为权威。
     std::string arch = "b";
-    BModelOptions model_config;  // 仅 arch=b 生效；各字段可经 CLI 覆盖
+    go::GoModelConfig model_config;  // 仅 arch=b 生效；各字段可经 CLI 覆盖
     int epochs = 4;
     int stop_after_epoch = 0;  // >0 = 训到该 epoch（1-based，不含）即存档退出
     std::string optimizer = "adamw";
@@ -245,10 +220,12 @@ TrainOptions parse_train_options(int argc, char** argv) {
         throw std::invalid_argument("--arch must be b or c");
     }
     {
-        const BModelOptions& cfg = options.model_config;
+        const go::GoModelConfig& cfg = options.model_config;
         if (cfg.d_model == 0 || cfg.num_layers == 0 || cfg.d_ff == 0 ||
-            cfg.conv_channels == 0 || cfg.history_len == 0) {
-            throw std::invalid_argument("B model dimensions must be positive");
+            cfg.conv_channels == 0 || cfg.history_len == 0 ||
+            cfg.history_vocab < go::history_vocab_size) {
+            throw std::invalid_argument(
+                "B model dimensions must be positive and history-vocab >= 367");
         }
         if (cfg.d_model % cfg.num_heads != 0) {
             throw std::invalid_argument("--d-model must be divisible by --num-heads");
@@ -319,6 +296,35 @@ std::shared_ptr<nn::ComputeEngine> create_engine(const CommonOptions& options) {
         throw std::runtime_error(result.error().message);
     }
     return std::move(*result);
+}
+
+// M4 C 验证器：纯现成层（Conv2D + MaxPool + FC + CE），
+// 保留用于 B vs C 对照与 M5 语义回归。
+nn::CnnConfig c_validator_config() {
+    nn::CnnConfig config;
+    config.in_channels = go::feature_plane_count;
+    config.in_size = go::training_board_size;
+    config.pool = 2;
+    config.convs = {
+        {.out_channels = 32, .kernel = 3, .stride = 1, .padding = 1},
+        {.out_channels = 64, .kernel = 3, .stride = 1, .padding = 1},
+    };
+    config.fc_dims = {256, go::policy_class_count};
+    config.norm_type = nn::NormType::BatchNorm;
+    config.norm_place = nn::NormPlace::None;
+    return config;
+}
+
+nn::ModelSpec c_validator_spec(const nn::CnnConfig& config) {
+    return nn::make_cnn_spec(
+        config.in_channels,
+        config.in_size,
+        config.pool,
+        config.convs,
+        config.fc_dims,
+        config.norm_type,
+        config.norm_place
+    );
 }
 
 std::vector<std::size_t> sample_indices(
@@ -418,6 +424,7 @@ EvalMetrics evaluate(
     }
     nn::ComputeEngine& engine = model.engine();
     nn::CrossEntropyLoss loss_fn;
+    go::GoLoss go_loss;
     model.set_training(false);
 
     Scalar loss_sum = 0;
@@ -438,8 +445,17 @@ EvalMetrics evaluate(
         write_model_input(engine, input, batch, cache.feature_count(), count, history_len);
         nn::Tensor output = forward_evaluated(model, input);
         const std::vector<std::size_t>& labels = batch.labels;
-        const Scalar loss = NN_UNWRAP(loss_fn.forward_sparse(
-            engine, output, labels, {}, go::policy_class_count));
+        Scalar loss = 0;
+        if (history_len > 0) {
+            // B: dual-head loss = policy CE (row 0..361) + value MSE (row 362).
+            loss = NN_UNWRAP(go_loss.forward(
+                engine, output, std::span<const std::size_t>(labels),
+                std::span<const Scalar>(batch.values)
+            ));
+        } else {
+            loss = NN_UNWRAP(loss_fn.forward_sparse(
+                engine, output, labels, {}, go::policy_class_count));
+        }
         loss_sum += loss * static_cast<Scalar>(count);
 
         logits.resize(output.size());
@@ -487,12 +503,11 @@ EvalMetrics evaluate(
                     }
                 }
             }
-            // Row 362 (== policy_class_count) holds tanh(v) in [-1, 1]: the
-            // value prediction. Only a dual-head model has that row, hence the
-            // history_len guard. AUC is computed only over decisive games.
+            // Row 362 holds tanh(v) in [-1, 1]: the value prediction. AUC is
+            // computed only over decisive games (z != 0).
             if (history_len > 0 && batch.values[column] != Scalar{0}) {
                 value_pairs.emplace_back(
-                    logits[go::policy_class_count * count + column],
+                    logits[go::value_row_index * count + column],
                     batch.values[column]
                 );
             }
@@ -529,8 +544,13 @@ EvalMetrics evaluate(
                    value_pairs[order[j + 1]].first == value_pairs[order[i]].first) {
                 ++j;
             }
+            // Ties share the mean of the ranks they span: ranks [rank, rank+len-1]
+            // ⇒ rank + (len-1)/2. (rank+len)/2 is off by half a rank for every
+            // group of size 1 — it biases the statistic negative.)
+            const std::size_t span = j - i + 1;
             const long double average_rank =
-                static_cast<long double>(rank + (j - i + 1)) / 2.0L;
+                static_cast<long double>(rank) +
+                static_cast<long double>(span - 1) / 2.0L;
             for (std::size_t m = i; m <= j; ++m) {
                 if (value_pairs[order[m]].second > 0) {
                     wins += average_rank;
@@ -749,12 +769,13 @@ int train(const TrainOptions& options) {
 
     const std::string dataset_sha256 = NN_UNWRAP(nn::sha256_file_hex(options.dataset));
 
-    // B needs history rows: both caches must be v2 with a K matching --history-len.
+    // B needs history rows: both caches must be v2 with a K matching the model.
     // A v1 cache (history_len()==0) is rejected loudly rather than silently fed
     // zeros — that would look like "the history branch buys nothing". This is a
-    // data-contract gate, so it runs before any model construction.
-    if (options.arch == "b") {
-        const std::size_t requested_k = options.model_config.history_len;
+    // data-contract gate, so it runs before any model construction. On resume
+    // the authoritative K comes from the checkpoint spec, so that path checks
+    // after deriving it (below) instead of trusting --history-len.
+    auto require_history_k = [&](std::size_t requested_k) {
         for (const go::FeatureCache* cache : {&train_cache, &eval_cache}) {
             if (cache->history_len() != requested_k) {
                 throw std::runtime_error(
@@ -767,6 +788,9 @@ int train(const TrainOptions& options) {
                 );
             }
         }
+    };
+    if (options.resume.empty() && options.arch == "b") {
+        require_history_k(options.model_config.history_len);
     }
 
     // Effective architecture. On resume the checkpoint spec is authoritative
@@ -818,8 +842,24 @@ int train(const TrainOptions& options) {
         }
 
         const nn::ModelSpec file_spec = NN_UNWRAP(nn::peek_any_model_spec(options.resume));
-        model = std::make_unique<nn::Model>(build_model_from_spec(engine, file_spec));
+        model = std::make_unique<nn::Model>(
+            NN_UNWRAP(go::build_project_model_from_spec(engine, file_spec))
+        );
+        load_weights(options.resume, *model, nn::WeightLoadIntent::Trainable);
         spec = file_spec;
+        // Derive the effective architecture from the checkpoint spec so the
+        // data path (history rows, loss) matches what the weights expect.
+        if (go::is_go_spec(spec)) {
+            arch = "b";
+            history_len = NN_UNWRAP(go::go_config_from_spec(spec)).history_len;
+        } else {
+            arch = "c";
+            history_len = 0;
+        }
+        if (history_len > 0) {
+            // 续训的 K 由断点 spec 决定（--history-len 不参与），缓存必须匹配。
+            require_history_k(history_len);
+        }
 
         global_step_base = saved.counters.global_step;
         start_epoch = static_cast<int>(saved.counters.epoch);
@@ -834,12 +874,20 @@ int train(const TrainOptions& options) {
                   << " optimizer_step=" << optimizer_step
                   << " optimizer_tensors=" << optimizer_tensors
                   << '\n';
+    } else if (options.arch == "b") {
+        spec = go::make_go_spec(options.model_config);
+        model = std::make_unique<nn::Model>(
+            NN_UNWRAP(go::build_project_model(engine, options.model_config))
+        );
+        model->set_spec(spec);
+        history_len = options.model_config.history_len;
     } else {
-        // Fresh run. `--arch` selects the intended architecture, but neither
-        // builder exists while the B rewrite is in flight; fail loudly instead
-        // of resurrecting the removed implementation.
-        (void)options.arch;
-        model = std::make_unique<nn::Model>(build_model_from_spec(engine, spec));
+        const nn::CnnConfig cnn_config = c_validator_config();
+        spec = c_validator_spec(cnn_config);
+        model = std::make_unique<nn::Model>(
+            NN_UNWRAP(nn::build_cnn_model(engine, cnn_config))
+        );
+        model->set_spec(spec);
         history_len = 0;
     }
     model->set_training(true);
@@ -877,6 +925,7 @@ int train(const TrainOptions& options) {
         nn::TrainingSession::create(std::move(*model), training_config)
     );
     nn::CrossEntropyLoss loss_fn;
+    go::GoLoss go_loss;
 
     if (resumed) {
         // 优化器身份已由状态段决定；张量数量/形状对不上由 load_state 硬错。
@@ -966,6 +1015,7 @@ int train(const TrainOptions& options) {
             write_model_input(
                 engine, input, batch, train_cache.feature_count(), count, history_len);
             const std::vector<std::size_t>& labels = batch.labels;
+            const std::vector<Scalar>& values = batch.values;
 
             Scalar batch_loss = 0;
             nn::TrainingStepOptions step_options;
@@ -980,15 +1030,28 @@ int train(const TrainOptions& options) {
                     auto output = current.forward(batch_input);
                     NN_TRY_CHECK(output);
                     Scalar loss_value = 0;
-                    // Policy-only cross-entropy (M4/M5 semantics). The dual-head
-                    // value loss returns together with the B rewrite.
-                    auto loss = loss_fn.forward_sparse(
-                        current_engine, *output, labels, {},
-                        go::policy_class_count
-                    );
-                    NN_TRY_CHECK(loss);
-                    loss_value = *loss;
-                    nn::Result<nn::Tensor> gradient = loss_fn.backward();
+                    nn::Result<nn::Tensor> gradient{};
+                    if (history_len > 0) {
+                        // B: dual-head loss. Policy CE over rows 0..361 +
+                        // value MSE over row 362, combined into one grad.
+                        auto loss = go_loss.forward(
+                            current_engine, *output,
+                            std::span<const std::size_t>(labels),
+                            std::span<const Scalar>(values)
+                        );
+                        NN_TRY_CHECK(loss);
+                        loss_value = *loss;
+                        gradient = go_loss.backward();
+                    } else {
+                        // C: policy-only cross-entropy (M4/M5 semantics).
+                        auto loss = loss_fn.forward_sparse(
+                            current_engine, *output, labels, {},
+                            go::policy_class_count
+                        );
+                        NN_TRY_CHECK(loss);
+                        loss_value = *loss;
+                        gradient = loss_fn.backward();
+                    }
                     NN_TRY_CHECK(gradient);
                     batch_loss = loss_value;
                     nn::TrainingStepOutput result;
@@ -1074,7 +1137,8 @@ int train(const TrainOptions& options) {
 
     const nn::ModelSpec loaded_checkpoint_spec =
         NN_UNWRAP(nn::peek_any_model_spec(options.checkpoint));
-    nn::Model checkpoint_model = build_model_from_spec(engine, loaded_checkpoint_spec);
+    nn::Model checkpoint_model =
+        NN_UNWRAP(go::build_project_model_from_spec(engine, loaded_checkpoint_spec));
     load_weights(options.checkpoint, checkpoint_model, nn::WeightLoadIntent::Inference);
     const double checkpoint_diff = max_logit_difference(
         session.model(), checkpoint_model, eval_cache,
@@ -1083,7 +1147,8 @@ int train(const TrainOptions& options) {
 
     const nn::ModelSpec loaded_model_spec =
         NN_UNWRAP(nn::peek_any_model_spec(options.model));
-    nn::Model inference_model = build_model_from_spec(engine, loaded_model_spec);
+    nn::Model inference_model =
+        NN_UNWRAP(go::build_project_model_from_spec(engine, loaded_model_spec));
     load_weights(options.model, inference_model, nn::WeightLoadIntent::Inference);
     const double model_diff = max_logit_difference(
         session.model(), inference_model, eval_cache,
@@ -1180,7 +1245,7 @@ struct MakeModelOptions {
     CommonOptions common;
     std::string output;
     std::string arch = "b";  // b = B encoder (default), c = M4 CNN validator
-    BModelOptions model_config;
+    go::GoModelConfig model_config;
 };
 
 MakeModelOptions parse_make_model_options(int argc, char** argv) {
@@ -1218,14 +1283,22 @@ MakeModelOptions parse_make_model_options(int argc, char** argv) {
     return options;
 }
 
-// 确定性地构建一个未训练的推理模型。模型构建随 B 重写一起恢复：这里只
-// 保留入口，避免任何命令静默产出一个与训练侧不一致的模型。
+// 确定性地构建一个未训练的推理模型（GTP/Arena 测试需要一个与训练侧同一
+// spec 的模型文件；模型初始化本身是 seed 确定的）。默认产 B；--arch c
+// 保留以复现 M4 C 验证器。
 int make_model(const MakeModelOptions& options) {
     std::shared_ptr<nn::ComputeEngine> engine_ptr = create_engine(options.common);
     nn::ComputeEngine& engine = *engine_ptr;
     nn::ModelSpec spec;
-    nn::Model model = build_model_from_spec(engine, spec);
-    (void)options.arch;
+    nn::Model model =
+        options.arch == "b"
+            ? NN_UNWRAP(go::build_project_model(engine, options.model_config))
+            : NN_UNWRAP(nn::build_cnn_model(engine, c_validator_config()));
+    if (options.arch == "b") {
+        spec = go::make_go_spec(options.model_config);
+    } else {
+        spec = c_validator_spec(c_validator_config());
+    }
     model.set_spec(spec);
     model.set_training(false);
     std::filesystem::create_directories(
@@ -1248,10 +1321,17 @@ int evaluate_cli(const EvalOptions& options) {
     nn::ComputeEngine& engine = *engine_ptr;
     const nn::ModelSpec spec = NN_UNWRAP(nn::peek_any_model_spec(options.model));
     std::cerr << "loaded model spec: " << nn::spec_summary(spec) << '\n';
-    nn::Model model = build_model_from_spec(engine, spec);
-    // The history input length is part of the model contract; it is restored
-    // together with the B rewrite. Until then every evaluation runs planes-only.
-    const std::size_t history_len = 0;
+    nn::Model model = NN_UNWRAP(go::build_project_model_from_spec(engine, spec));
+    const std::size_t history_len =
+        go::is_go_spec(spec) ? NN_UNWRAP(go::go_config_from_spec(spec)).history_len : 0;
+    if (history_len > 0 && cache.history_len() != history_len) {
+        throw std::runtime_error(
+            "B model needs move history but cache '" + options.dataset +
+            "' has history_len=" + std::to_string(cache.history_len()) +
+            " (model K=" + std::to_string(history_len) +
+            "). Regenerate with --history-len " + std::to_string(history_len) + "."
+        );
+    }
     std::cerr << "built model from spec\n";
     const nn::ModelRole role = NN_UNWRAP(nn::peek_model_role(options.model));
     std::cerr << "model role: " << nn::model_role_name(role) << '\n';
@@ -1266,7 +1346,7 @@ int evaluate_cli(const EvalOptions& options) {
         {"status", "pass"},
         {"model", options.model},
         {"role", nn::model_role_name(role)},
-        {"arch", "unknown"},
+        {"arch", go::is_go_spec(spec) ? "b" : "c"},
         {"engine", options.common.use_gpu ? "vulkan" : "cpu"},
         {"metrics", metrics_json(metrics)},
     }.dump(2) << '\n';

@@ -1,28 +1,92 @@
 #include "go/policy.hpp"
 
+#include <algorithm>
+#include <cstddef>
+#include <limits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <neuralnet.cpp/nn.hpp>
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
 
 #include "go/features.hpp"
+#include "go/go_model.hpp"
 
 namespace go {
+namespace {
+
+// 与 go_train_cli 相同的前向包裹：显式 batch 作用域（多 Conv 模型在
+// Vulkan 下不包作用域会在第二次 Conv 分配时报 VK_ERROR_OUT_OF_DEVICE_MEMORY，
+// 见 docs/benchmarks/m4-c-validator.md §7）。
+nn::Tensor forward_scoped(nn::Model& model, const nn::Tensor& input) {
+    nn::ComputeEngine& engine = model.engine();
+    auto begin = engine.begin_batch();
+    if (!begin) {
+        throw std::runtime_error("cannot begin inference batch: " + begin.error().message);
+    }
+    auto output = model.forward(input);
+    auto end = engine.end_batch();
+    if (!output) {
+        throw std::runtime_error("inference forward failed: " + output.error().message);
+    }
+    if (!end) {
+        throw std::runtime_error("cannot end inference batch: " + end.error().message);
+    }
+    return std::move(*output);
+}
+
+// Point → GoTokenizer id（y * 19 + x）。与 .ngf 的目标坐标、Python 训练器
+// 同一约定，训练与推理看到的历史 id 完全一致。
+std::uint16_t history_token(const std::optional<Point>& point) {
+    if (!point.has_value()) {
+        return history_pass_token;  // 361
+    }
+    return static_cast<std::uint16_t>(
+        static_cast<std::size_t>(point->y) * training_board_size +
+        static_cast<std::size_t>(point->x)
+    );
+}
+
+// 从当前对局重建最近 K 手历史：时间顺序、左侧 <pad> 补齐、右对齐，
+// 与 .ngf v2 导出口径一致。
+void fill_history(const Game& game, std::span<std::uint16_t> history) {
+    const std::vector<PlayedMove> moves = game.history();
+    const std::size_t k = history.size();
+    std::fill(history.begin(), history.end(), history_pad_token);
+    const std::size_t window = std::min<std::size_t>(k, moves.size());
+    for (std::size_t offset = 0; offset < window; ++offset) {
+        history[k - window + offset] =
+            history_token(moves[moves.size() - window + offset].point);
+    }
+}
+
+}  // namespace
 
 struct PolicyPlayer::Impl {
     std::string model_path;
     std::shared_ptr<nn::ComputeEngine> engine;
+    nn::Model model;
+    std::size_t history_len;  // 0 = C 验证器（仅平面），>0 = B 编码器
+    std::vector<float> features;
+    std::vector<std::uint16_t> history;  // B: K 手历史，左侧 <pad> 补齐
+    std::vector<nn::Scalar> packed;      // B: 平面行 + 历史行，单列
+    std::vector<nn::Scalar> logits;
+
+    explicit Impl(std::shared_ptr<nn::ComputeEngine> engine_value,
+                  nn::Model model_value, std::size_t history_len_value)
+        : engine(std::move(engine_value)),
+          model(std::move(model_value)),
+          history_len(history_len_value) {}
 };
 
 PolicyPlayer PolicyPlayer::load(
     const std::string& model_path,
     const std::string& device
 ) {
-    // 引擎仍然在这里建立：GTP/Arena 的 --gpu/--cpu 语义与设备可用性检查
-    // 不依赖模型层，先于模型重写保留下来。
     nn::cli::EngineConfig config;
     config.use_gpu = !device.empty();
     config.gpu_device = device;
@@ -30,9 +94,31 @@ PolicyPlayer PolicyPlayer::load(
     if (!engine_result) {
         throw std::runtime_error(engine_result.error().message);
     }
-    auto impl = std::make_unique<Impl>();
-    impl->engine = std::move(*engine_result);
+    std::shared_ptr<nn::ComputeEngine> engine = std::move(*engine_result);
+
+    const nn::ModelSpec spec = NN_UNWRAP(nn::peek_any_model_spec(model_path));
+    nn::Model model = NN_UNWRAP(go::build_project_model_from_spec(*engine, spec));
+    const std::size_t history_len =
+        go::is_go_spec(spec) ? NN_UNWRAP(go::go_config_from_spec(spec)).history_len : 0;
+    auto verified = nn::verify_model_integrity(model_path);
+    if (!verified) {
+        throw std::runtime_error(
+            "model integrity check failed for '" + model_path + "': " +
+            verified.error().message
+        );
+    }
+    // load_model 返回内嵌 tokenizer 字节（本模型无分词器，忽略）。
+    const std::string tokenizer_bytes = NN_UNWRAP(nn::load_model(model_path, model));
+    (void)tokenizer_bytes;
+    model.set_training(false);
+
+    auto impl = std::make_unique<Impl>(std::move(engine), std::move(model), history_len);
     impl->model_path = model_path;
+    impl->features.resize(feature_element_count);
+    if (history_len > 0) {
+        impl->history.assign(history_len, history_pad_token);
+        impl->packed.resize(feature_element_count + history_len);
+    }
     return PolicyPlayer(std::move(impl));
 }
 
@@ -54,12 +140,70 @@ std::optional<Point> PolicyPlayer::select_move(const Game& game) {
             "policy inference requires a 19x19 board (M3 v1 feature contract)"
         );
     }
-    // 模型层正在重写（B 架构 + dsl::compute + AOT 融合）。在它落地前，
-    // genmove 明确报错，而不是退回已删除的手拼实现继续出招——一个"能出招
-    // 但输入契约与训练侧不一致"的模型比报错更危险。
-    throw std::runtime_error(
-        "policy model is not loadable: M7 model rewrite in progress"
-    );
+    Impl& state = *impl_;
+    const Stone color = game.to_move();
+
+    extract_features(game, color, state.features);
+
+    // 输入布局：列主（feature, batch），batch=1。B 模型把历史 id 作为额外的
+    // K 行追加到平面之后（f32 存放的整数 id），契约见 go_model.hpp。
+    nn::ComputeEngine& engine = *state.engine;
+    const std::size_t input_rows = state.history_len > 0
+        ? go::go_input_rows(state.history_len)
+        : feature_element_count;
+    nn::Tensor input = engine.create_tensor(input_rows, 1);
+    if (!input.valid()) {
+        throw std::runtime_error("cannot allocate policy input tensor");
+    }
+    if (state.history_len > 0) {
+        fill_history(game, state.history);
+        for (std::size_t i = 0; i < feature_element_count; ++i) {
+            state.packed[i] = static_cast<nn::Scalar>(state.features[i]);
+        }
+        for (std::size_t i = 0; i < state.history_len; ++i) {
+            state.packed[feature_element_count + i] =
+                static_cast<nn::Scalar>(state.history[i]);
+        }
+        NN_UNWRAP(engine.write(input, std::span<const nn::Scalar>(state.packed)));
+    } else {
+        NN_UNWRAP(engine.write(input, std::span<const nn::Scalar>(state.features)));
+    }
+
+    nn::Tensor output = forward_scoped(state.model, input);
+    state.logits.resize(output.size());
+    NN_UNWRAP(engine.read(output, std::span<nn::Scalar>(state.logits)));
+
+    // 合法性掩码 + argmax（host 侧，roadmap §4）。argmax 只扫策略行
+    // [0, policy_class_count)；B 的第 362 行是价值输出，不参与选点。
+    constexpr std::size_t kPass = feature_plane_stride;  // 361
+    nn::Scalar best = -std::numeric_limits<nn::Scalar>::infinity();
+    std::optional<Point> best_point;  // nullopt = pass
+    bool have_move = false;
+
+    if (game.is_legal(color, std::nullopt)) {
+        best = state.logits[kPass];
+        have_move = true;
+    }
+    for (int y = 0; y < game.height(); ++y) {
+        for (int x = 0; x < game.width(); ++x) {
+            const Point point{x, y};
+            if (!game.is_legal(color, point)) {
+                continue;
+            }
+            const std::size_t index =
+                static_cast<std::size_t>(y) * game.width() + x;
+            if (state.logits[index] > best) {
+                best = state.logits[index];
+                best_point = point;
+                have_move = true;
+            }
+        }
+    }
+    if (!have_move) {
+        // 全部非法（理论上只有终局后才会发生）：按 pass 处理。
+        return std::nullopt;
+    }
+    return best_point;
 }
 
 }  // namespace go

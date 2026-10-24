@@ -134,6 +134,16 @@ class M5TrainerTests(unittest.TestCase):
             "--min-lr", "0.00001",
             "--weight-decay", "0.0001",
             "--seed", str(SEED),
+            # M7: B is the mainline architecture. Keep the widths tiny so the
+            # resume-equivalence property is still verified on the shipping
+            # model while staying inside the CI budget.
+            "--arch", "b",
+            "--d-model", "32",
+            "--num-layers", "2",
+            "--num-heads", "4",
+            "--d-ff", "64",
+            "--conv-channels", "16",
+            "--history-len", "64",
             "--checkpoint", str(work / "c.nnckpt"),
             "--model", str(work / "m.nnmodel"),
             "--metrics-out", str(work / "metrics.json"),
