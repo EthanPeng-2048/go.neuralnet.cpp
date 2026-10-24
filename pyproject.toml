@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Batch SGF, nngames, tokenizer, and feature pipeline for go.neuralnet.cpp"
 readme = "README.md"
 license = "LGPL-3.0-only"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "LICENSES/*.txt"]
 requires-python = ">=3.12"
 authors = [{ name = "EthanPeng-2048" }]
 dependencies = [

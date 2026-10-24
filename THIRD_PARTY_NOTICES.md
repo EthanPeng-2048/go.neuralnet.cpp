@@ -8,6 +8,9 @@ not replace the license text shipped with each component.
 Original source code and documentation in this repository are licensed under
 LGPL-3.0-only. See [LICENSE](LICENSE).
 
+LGPL-3.0 incorporates terms from GPL-3.0. A copy of the GPL-3.0 text is
+included at [LICENSES/GPL-3.0-only.txt](LICENSES/GPL-3.0-only.txt).
+
 The submodules, Python packages, data, and externally referenced material are
 separate works and remain under their own terms.
 

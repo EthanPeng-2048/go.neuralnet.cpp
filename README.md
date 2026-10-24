@@ -108,4 +108,6 @@ python3 bench/m0_layer_bench.py \
 
 项目原创代码采用 [GNU Lesser General Public License v3.0 only](LICENSE)
 （LGPL-3.0-only）。Submodule、Python 依赖和数据集继续遵循各自许可证；
-详情见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+LGPL 所引用的 GPL-3.0 全文见
+[`LICENSES/GPL-3.0-only.txt`](LICENSES/GPL-3.0-only.txt)，其余详情见
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
