@@ -83,6 +83,29 @@ same cache and seed.
 | Value AUC (B only) | — | 0.37 (train 0.9995) |
 | Seconds / epoch | 5.4 | 216 |
 
+### B at 20 epochs (same 110-game cache, 40HX)
+
+Training longer does not close the gap — it memorises:
+
+| epoch | train loss | eval loss | eval top-1 | eval top-3 |
+|---:|---:|---:|---:|---:|
+| 1 | 6.91 | 7.61 | 0.99% | 2.81% |
+| 4 | 5.53 | 7.44 | 1.87% | 5.12% |
+| 8 | 4.19 | **6.91** | **4.51%** | 10.45% |
+| 12 | 3.31 | 7.23 | 4.40% | 10.84% |
+| 16 | 2.51 | 7.64 | 4.07% | 8.97% |
+| 20 | 2.05 | 7.89 | 3.58% | 8.47% |
+
+The best point (4.51% at epoch 8) is statistically the same as C's 4.62%, and
+everything after it is pure overfitting: train loss falls to 2.05 while eval
+loss climbs back to 7.89.
+
+### Head-to-head
+
+`go_arena_cli --player model:run-c.nnmodel --opponent model:run-b.nnmodel
+--games 20 --size 19 --komi 7.5`: **C won 20-0** (deterministic argmax players,
+so each colour pairing produces one game — 684 and 811 moves).
+
 ### What this says
 
 1. **Speed budget: met.** §7 estimated 915 positions/s (inference, B-small,
@@ -94,11 +117,11 @@ same cache and seed.
    closes as data grows (30 games: 1.27% vs 1.74%; 110 games: 1.82% vs 4.62% —
    B nearly doubles, C nearly triples), and B's *training* fit is far ahead
    (13.4% vs 4.2% top-1 at 30 games), i.e. B is capacity-rich and data-poor.
-3. **B is also undertrained at equal epochs.** Its eval top-1 is still rising
-   monotonically (0.99 → 0.88 → 1.49 → 1.82) at epoch 4 while C has already
-   peaked and is drifting down. The DoD comparison therefore needs either many
-   more epochs or M9-scale data (10k games); the honest verdict at 110 games is
-   "B loses", not "B wins".
+3. **More epochs do not help** (table above): B peaks at 4.51% (epoch 8) and
+   degrades afterwards, exactly the signature of a model whose capacity is not
+   matched by data. The DoD comparison needs M9-scale data (10k games, ~2M
+   samples); the honest verdict at 110 games is "B ties C on quality and loses
+   20-0 head to head", not "B wins".
 
 ## Input-contract verification
 
