@@ -100,6 +100,23 @@ The best point (4.51% at epoch 8) is statistically the same as C's 4.62%, and
 everything after it is pure overfitting: train loss falls to 2.05 while eval
 loss climbs back to 7.89.
 
+### Hyperparameter sweep (smaller B, 8 epochs, 40HX)
+
+Shrinking the model helps a lot at this data scale (~113 s/epoch for every row,
+so the Conv stem and the layout ops dominate, not the transformer width):
+
+| Config | Best epoch | Eval top-1 | Eval top-3 | Value AUC |
+|---|---:|---:|---:|---:|
+| d=128 / 6 layers / ff=512 / conv=32, lr 1e-3, vw=1 | 6 | **4.57%** | 11.99% | **0.518** |
+| same, lr 3e-4 + warmup | 6 | 3.52% | 9.02% | 0.472 |
+| same, lr 1e-3, vw=0.25 + warmup | 8 | 4.46% | 10.78% | 0.478 |
+| d=96 / 6 layers / ff=384 / conv=32, lr 1e-3, vw=0.25 | 6 | 1.10% | 2.75% | 0.409 |
+| C validator (reference) | 3 | 4.62% | 12.60% | — |
+
+`--value-weight` (new) and `step_cosine` (cosine warm restarts, expressed as a
+per-epoch lr table on top of the library's scheduIer) came out of this sweep.
+d=96 is too narrow; d=128 is the smallest width that matches C.
+
 ### Head-to-head
 
 `go_arena_cli --player model:run-c.nnmodel --opponent model:run-b.nnmodel
