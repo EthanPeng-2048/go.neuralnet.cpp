@@ -7,9 +7,19 @@ project(go_neuralnet
     LANGUAGES CXX
 )
 
-set(CMAKE_CXX_STANDARD 26)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+# C++26. CMake 4.x has no CXX26 dialect flag for MSVC (cl 19.51 routes C++26
+# features through /std:c++latest), so mirror the library's own split: MSVC gets
+# the C++23 dialect plus an explicit /std:c++latest, everyone else gets C++26.
+if(MSVC)
+    set(CMAKE_CXX_STANDARD 23)
+    set(CMAKE_CXX_STANDARD_REQUIRED OFF)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+    add_compile_options(/std:c++latest)
+else()
+    set(CMAKE_CXX_STANDARD 26)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
