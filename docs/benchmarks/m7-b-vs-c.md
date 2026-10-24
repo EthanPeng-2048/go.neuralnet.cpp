@@ -57,30 +57,48 @@ B's own value-head metrics.
 
 ## Measured results
 
-Both runs below are the same recipe on the same cache (30 train games / 6353
-samples, 10 eval games / 2129 samples), differing only in `--arch`; numbers
-come from the run JSONs.
+Two sizes, same recipe per size (`--arch` is the only difference), all on the
+same cache and seed.
 
-| Metric | C validator | B encoder | Notes |
-|---|---:|---:|---|
-| Eval policy top-1 (final) | 1.74% | 1.27% | higher is better |
-| Eval policy top-3 (final) | 2.91% | 3.19% | |
-| Eval loss (final) | 5.735 | 8.10 | B's loss includes the value MSE — not comparable |
-| Value AUC (B only) | — | 0.37 | 0.5 = chance |
-| Checkpoint round-trip diff | 0.0 | 0.0 | bit-exact reload (CPU and GPU) |
-| Seconds / epoch | 5.4 | 216 | 850M, batch 16 |
+### 40HX, 110-game cache (100 train games / 21159 samples, 10 eval / 1818)
 
-**At this data scale B is not yet better than C on eval top-1, and the reason is
-visible in the train-set numbers:** evaluated on the *training* cache, C reaches
-4.2% top-1 / 8.1% top-3 while B reaches 13.4% / 24.6% (value AUC 0.999). B has
-the capacity and learns the task, but 30 games (6.4k samples) cannot support
-~4M parameters: it memorizes. The M7 DoD ("同数据下 B 显著优于 C") therefore
-needs the dataset scale that M9 uses (10k+ games); the 40HX run reported in
-this file is the acceptance vehicle, not the 850M smoke.
+| Metric | C validator | B encoder |
+|---|---:|---:|
+| Eval top-1 (epoch 4) | **4.62%** | 1.82% |
+| Eval top-3 (epoch 4) | **12.60%** | 3.91% |
+| Eval loss (epoch 4) | 4.737 | 7.774 (CE + value MSE — not comparable) |
+| Value AUC (B only) | — | 0.389 |
+| Checkpoint round-trip diff | 0.0 | 0.0 |
+| Train loss, epoch 1 → 4 | 5.75 → 4.40 | 7.32 → 5.16 |
+| Seconds / epoch (batch 32) | **10.9** | 137 |
+| Inference (batch 32) | 7697 pos/s | **1312 pos/s** |
 
-Also note the value head *hurts* at this scale: its eval AUC (0.37) is below
-chance while its train AUC is 0.999, i.e. it memorizes outcomes, and its
-gradient shares the trunk with the policy head.
+### GTX 850M, 30-game cache (6353 / 2129 samples, batch 16)
+
+| Metric | C validator | B encoder |
+|---|---:|---:|
+| Eval top-1 (final) | 1.74% | 1.27% |
+| Eval top-3 (final) | 2.91% | 3.19% |
+| Train top-1 / top-3 | 4.17% / 8.11% | 13.36% / 24.62% |
+| Value AUC (B only) | — | 0.37 (train 0.9995) |
+| Seconds / epoch | 5.4 | 216 |
+
+### What this says
+
+1. **Speed budget: met.** §7 estimated 915 positions/s (inference, B-small,
+   batch 64 component-sum). Measured end to end on the 40HX: **1312 pos/s** at
+   batch 32. Training throughput (154 pos/s) is well below the 694 pos/s
+   training estimate — that number assumed a pure Transformer stack; the real
+   model spends its time in the Conv stem and the sequence assembly.
+2. **B generalises worse than C at every data size we can run here.** The gap
+   closes as data grows (30 games: 1.27% vs 1.74%; 110 games: 1.82% vs 4.62% —
+   B nearly doubles, C nearly triples), and B's *training* fit is far ahead
+   (13.4% vs 4.2% top-1 at 30 games), i.e. B is capacity-rich and data-poor.
+3. **B is also undertrained at equal epochs.** Its eval top-1 is still rising
+   monotonically (0.99 → 0.88 → 1.49 → 1.82) at epoch 4 while C has already
+   peaked and is drifting down. The DoD comparison therefore needs either many
+   more epochs or M9-scale data (10k games); the honest verdict at 110 games is
+   "B loses", not "B wins".
 
 ## Input-contract verification
 
