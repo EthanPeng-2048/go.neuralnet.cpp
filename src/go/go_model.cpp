@@ -74,6 +74,7 @@ nn::ModelSpec make_go_spec(const GoModelConfig& config) {
         config.conv_channels,
         config.region_grid,
         config.history_vocab,
+        config.cnn_policy ? std::size_t{1} : std::size_t{0},
     };
     return spec;
 }
@@ -99,6 +100,8 @@ nn::Result<GoModelConfig> go_config_from_spec(const nn::ModelSpec& spec) {
     config.history_len = spec.layer_dims[1];
     config.conv_channels = spec.layer_dims[2];
     config.history_vocab = spec.layer_dims[4];
+    // 第 6 项是后加的（旧断点/模型没有它）→ 缺省视为关闭。
+    config.cnn_policy = spec.layer_dims.size() >= 6 && spec.layer_dims[5] != 0;
     // 交叉校验：seq_len 必须与 K 自洽（防止手工改过的 spec 静默错位）。
     if (spec.seq_len != go_total_tokens(config.history_len)) {
         NN_FAIL("go_config_from_spec: seq_len 与 history_len 不自洽");
@@ -147,7 +150,8 @@ GoModel::GoModel(const GoModelConfig& config)
       relu2_(),
       ln_f_(nn::make_norm_layer(config.d_model, nn::NormType::LayerNorm)),
       policy_head_(config.d_model, policy_class_count),
-      value_head_(config.d_model, 1) {
+      value_head_(config.d_model, 1),
+      cnn_policy_head_(config.d_model * region_token_count, policy_class_count) {
     validate_config(config);
     // 4×4 stride 4 padding 1 把 19×19 压到 5×5：区域 token 数必须与常量一致。
     const std::size_t out_hw =
@@ -205,6 +209,9 @@ nn::Result<void> GoModel::init_impl(nn::ComputeEngine& engine) {
     NN_TRY(r4, ln_f_->init(engine));
     NN_TRY(r5, policy_head_.init(engine));
     NN_TRY(r6, value_head_.init(engine));
+    if (cfg_.cnn_policy) {
+        NN_TRY(r7, cnn_policy_head_.init(engine));
+    }
     return {};
 }
 
@@ -215,7 +222,9 @@ std::vector<nn::TensorRef> GoModel::parameters() {
         conv1_.parameters(), conv2_.parameters(),
         collect_block_refs_(blocks_, &nn::TransformerEncoderLayer::parameters),
         ln_f_->parameters(),
-        policy_head_.parameters(), value_head_.parameters()
+        policy_head_.parameters(), value_head_.parameters(),
+        cfg_.cnn_policy ? cnn_policy_head_.parameters()
+                        : std::vector<nn::TensorRef>{}
     );
 }
 
@@ -225,7 +234,9 @@ std::vector<nn::TensorRef> GoModel::param_gradients() {
         conv1_.param_gradients(), conv2_.param_gradients(),
         collect_block_refs_(blocks_, &nn::TransformerEncoderLayer::param_gradients),
         ln_f_->param_gradients(),
-        policy_head_.param_gradients(), value_head_.param_gradients()
+        policy_head_.param_gradients(), value_head_.param_gradients(),
+        cfg_.cnn_policy ? cnn_policy_head_.param_gradients()
+                        : std::vector<nn::TensorRef>{}
     );
 }
 
@@ -240,6 +251,9 @@ std::vector<nn::Layer*> GoModel::param_children() noexcept {
     children.push_back(ln_f_.get());
     children.push_back(&policy_head_);
     children.push_back(&value_head_);
+    if (cfg_.cnn_policy) {
+        children.push_back(&cnn_policy_head_);
+    }
     return children;
 }
 
@@ -255,6 +269,7 @@ void GoModel::set_precision_profile(const nn::PrecisionProfile& profile) {
     if (ln_f_) ln_f_->set_precision_profile(profile);
     policy_head_.set_precision_profile(profile);
     value_head_.set_precision_profile(profile);
+    if (cfg_.cnn_policy) cnn_policy_head_.set_precision_profile(profile);
 }
 
 void GoModel::set_training(bool training) {
@@ -269,6 +284,7 @@ void GoModel::set_training(bool training) {
     if (ln_f_) ln_f_->set_training(training);
     policy_head_.set_training(training);
     value_head_.set_training(training);
+    if (cfg_.cnn_policy) cnn_policy_head_.set_training(training);
 }
 
 void GoModel::clear_cache() {
@@ -282,6 +298,7 @@ void GoModel::clear_cache() {
     if (ln_f_) ln_f_->clear_cache();
     policy_head_.clear_cache();
     value_head_.clear_cache();
+    if (cfg_.cnn_policy) cnn_policy_head_.clear_cache();
 }
 
 nn::Result<void> GoModel::ensure_indices_(
@@ -434,6 +451,14 @@ nn::Result<Tensor> GoModel::forward(const Tensor& input) {
 
     // ── 9. 双头 + tanh + 打包 ──────────────────────────────────────────
     NN_TRY(logits, policy_head_.forward(*q_col));      // (362, batch)
+    if (cfg_.cnn_policy) {
+        // 直通路径：特征图展平 (d·25, batch) → 362，与 query logits 相加。
+        NN_TRY(cnn_logits, cnn_policy_head_.forward(*r2));
+        NN_TRY(merged, nn::dsl::compute(engine,
+            nn::dsl::leaf(*logits) + nn::dsl::leaf(*cnn_logits),
+            policy_class_count, batch, p_.compute));
+        logits = std::move(merged);
+    }
     NN_TRY(value_pre, value_head_.forward(*q_col));    // (1, batch)
     NN_TRY(value, nn::dsl::compute(engine,
         nn::dsl::tanh(nn::dsl::leaf(*value_pre)), 1, batch, p_.compute));
@@ -521,7 +546,15 @@ nn::Result<Tensor> GoModel::backward(const Tensor& grad_output) {
         engine.rearrange_3d(*g_board_cols, d, region_token_count, batch,
                             /*inverse=*/false));                      // (25·d, batch) 行序 p·d+c
     NN_TRY(g_board, engine.gather_rows(*g_board_cp, region_perm_inv_)); // (d·25, batch)
-    NN_TRY(b_r2, relu2_.backward(*g_board));
+    Tensor board_grad = std::move(*g_board);
+    if (cfg_.cnn_policy) {
+        NN_TRY(cnn_grad, cnn_policy_head_.backward(*g_policy));  // (d·25, batch)
+        NN_TRY(merged_grad, nn::dsl::compute(engine,
+            nn::dsl::leaf(board_grad) + nn::dsl::leaf(*cnn_grad),
+            cfg_.d_model * region_token_count, batch, p_.compute));
+        board_grad = std::move(*merged_grad);
+    }
+    NN_TRY(b_r2, relu2_.backward(board_grad));
     NN_TRY(b_c2, conv2_.backward(*b_r2));
     NN_TRY(b_r1, relu1_.backward(*b_c2));
     NN_TRY(b_planes, conv1_.backward(*b_r1));                          // (3249, batch)

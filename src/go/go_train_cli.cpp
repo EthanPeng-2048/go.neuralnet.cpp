@@ -211,6 +211,8 @@ TrainOptions parse_train_options(int argc, char** argv) {
             options.model_config.conv_channels = std::stoull(option_value(i, argc, argv));
         } else if (arg == "--history-len") {
             options.model_config.history_len = std::stoull(option_value(i, argc, argv));
+        } else if (arg == "--cnn-policy") {
+            options.model_config.cnn_policy = std::stoi(option_value(i, argc, argv)) != 0;
         } else if (arg == "--seed") {
             options.seed = std::stoull(option_value(i, argc, argv));
         } else {
@@ -1308,6 +1310,8 @@ MakeModelOptions parse_make_model_options(int argc, char** argv) {
             options.model_config.conv_channels = std::stoull(option_value(i, argc, argv));
         } else if (arg == "--history-len") {
             options.model_config.history_len = std::stoull(option_value(i, argc, argv));
+        } else if (arg == "--cnn-policy") {
+            options.model_config.cnn_policy = std::stoi(option_value(i, argc, argv)) != 0;
         } else {
             throw std::invalid_argument("unknown make-model option: " + std::string(arg));
         }
@@ -1398,7 +1402,8 @@ void usage(const char* program) {
         << "  " << program << " train --dataset FILE.ngf --eval-dataset FILE.ngf"
         << " [--gpu=40HX] [--epochs 4] [--batch-size 64] [--arch b|c]\n"
         << "       [--d-model 192] [--num-layers 8] [--num-heads 8] [--d-ff 768]"
-        << " [--conv-channels 64] [--history-len 64] [--value-weight 1.0]\n"
+        << " [--conv-channels 64] [--history-len 64] [--value-weight 1.0]"
+        << " [--cnn-policy 0|1]\n"
         << "       [--optimizer adamw] [--schedule cosine] [--lr 0.001]"
         << " [--min-lr 0.00001] [--weight-decay 0.0001]\n"
         << "       [--schedule cosine|constant|step_cosine]"

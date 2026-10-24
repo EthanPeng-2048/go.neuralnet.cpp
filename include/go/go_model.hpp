@@ -72,6 +72,9 @@ struct GoModelConfig {
     std::size_t history_len = 64;      // K
     std::size_t history_vocab = history_vocab_size;
     std::size_t region_grid = go::region_grid;
+    // 设计 §3.1 兜底：策略头 + CNN 直通 logits。盘面细节不再只能经 25 个区域
+    // token 挤进 query——特征图展平后直接线性出 362 类，与 query 的 logits 相加。
+    bool cnn_policy = false;
 };
 
 // ── ModelSpec 往返（D6）────────────────────────────────────────────────────
@@ -136,6 +139,9 @@ private:
     std::unique_ptr<nn::Layer> ln_f_;
     nn::Linear policy_head_;
     nn::Linear value_head_;
+    // 可选：CNN 直通策略头（Linear(d·25 → 362)，见 GoModelConfig::cnn_policy）。
+    // 始终构造，只在启用时进入 parameters()/param_children() 与前反向。
+    nn::Linear cnn_policy_head_;
 
     // 自身参数张量（行主序：(rows, d_model)，与 GPTModel 的 token_emb_ 同形）
     nn::Tensor hist_emb_;    // (history_vocab, d)
