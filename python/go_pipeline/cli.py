@@ -20,6 +20,7 @@ from .features import (
 )
 from .model import GameRecord
 from .tokenizer import GoTokenizer
+from .training import build_training_caches
 
 
 def default_root() -> Path:
@@ -154,6 +155,32 @@ def cmd_features(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_training_cache(args: argparse.Namespace) -> None:
+    root = default_root()
+    dataset = Path(args.dataset or root / "data/cwi-10k.nngames").resolve()
+    train_output = Path(
+        args.train_output or root / "data/m4-c-train.ngf"
+    ).resolve()
+    eval_output = Path(
+        args.eval_output or root / "data/m4-c-eval.ngf"
+    ).resolve()
+    manifest = build_training_caches(
+        dataset=dataset,
+        data_cli=data_cli_path(root, args.data_cli),
+        rules_cli=rules_cli_path(root, args.rules_cli),
+        train_output=train_output,
+        eval_output=eval_output,
+        max_games=args.max_games,
+        eval_games=args.eval_games,
+        seed=args.seed,
+    )
+    if args.manifest:
+        manifest_path = Path(args.manifest).resolve()
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_bytes(orjson.dumps(manifest, option=orjson.OPT_INDENT_2))
+    print(orjson.dumps(manifest, option=orjson.OPT_INDENT_2).decode())
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="go-pipeline")
     sub = result.add_subparsers(dest="command", required=True)
@@ -195,6 +222,21 @@ def parser() -> argparse.ArgumentParser:
     features.add_argument("--output")
     features.add_argument("--npy-output")
     features.set_defaults(func=cmd_features)
+
+    cache = sub.add_parser(
+        "training-cache",
+        help="build versioned .ngf feature caches for the C validator",
+    )
+    cache.add_argument("--dataset")
+    cache.add_argument("--data-cli")
+    cache.add_argument("--rules-cli")
+    cache.add_argument("--train-output")
+    cache.add_argument("--eval-output")
+    cache.add_argument("--manifest")
+    cache.add_argument("--max-games", type=int, default=1000)
+    cache.add_argument("--eval-games", type=int, default=100)
+    cache.add_argument("--seed", type=int, default=20261024)
+    cache.set_defaults(func=cmd_training_cache)
     return result
 
 

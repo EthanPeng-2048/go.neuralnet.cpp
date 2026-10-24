@@ -21,14 +21,16 @@ from go_pipeline.features import (
     save_feature_contact_sheet,
     trace_record,
 )
-from go_pipeline.model import decode_move, encode_move
+from go_pipeline.model import GameRecord, decode_move, encode_move
 from go_pipeline.sgf import parse_sgf
 from go_pipeline.tokenizer import BOS, EOS, PAD, PASS, GoTokenizer
+from go_pipeline.training import write_feature_cache
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_CLI = ROOT / "build/cpu/go_data_cli"
 RULES_CLI = ROOT / "build/cpu/go_rules_cli"
+TRAIN_CLI = ROOT / "build/cpu/go_train_cli"
 
 
 class M2DataTests(unittest.TestCase):
@@ -185,6 +187,51 @@ class M3FeatureTests(unittest.TestCase):
         sample = sample_from_trace(trace, frame_index=len(frames) - 1, record=record)
         self.assertEqual(sample.planes.shape, (9, 5, 5))
         self.assertEqual(sample.planes[7, 1, 2], 1.0)
+
+    def test_versioned_training_cache_roundtrip(self) -> None:
+        record = GameRecord(
+            id="cache-test",
+            source_path="cache-test.sgf",
+            source_sha256="0" * 64,
+            board_size=19,
+            komi_twice=15,
+            handicap=0,
+            to_move="b",
+            outcome="black",
+            result="B+1",
+            rules="chinese",
+            black_player="black",
+            white_player="white",
+            event="test",
+            date="2026-10-24",
+            setup_black=(),
+            setup_white=(),
+            setup_empty=(),
+            moves=(encode_move("b", (0, 0)), encode_move("w", (18, 18)), encode_move("b", (1, 0))),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "sample.ngf"
+            result = write_feature_cache(
+                cache_path,
+                split="eval",
+                records=[(0, record)],
+                rules_cli=RULES_CLI,
+            )
+            self.assertEqual(result.records, 3)
+            inspected = json.loads(
+                subprocess.run(
+                    [str(TRAIN_CLI), "inspect", "--dataset", str(cache_path)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+            )
+            self.assertEqual(inspected["format"], "go.feature-cache")
+            self.assertEqual(inspected["format_version"], 1)
+            self.assertEqual(inspected["records"], 3)
+            self.assertEqual(inspected["features"], 9 * 19 * 19)
+            self.assertEqual(inspected["board_size"], 19)
+            self.assertEqual(inspected["first"]["target"], 0)
 
 
 if __name__ == "__main__":

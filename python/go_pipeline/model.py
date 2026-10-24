@@ -31,6 +31,29 @@ class GameRecord:
     setup_empty: tuple[int, ...]
     moves: tuple[int, ...]
 
+    @classmethod
+    def from_json(cls, value: dict[str, object]) -> "GameRecord":
+        return cls(
+            id=str(value["id"]),
+            source_path=str(value["source_path"]),
+            source_sha256=str(value["source_sha256"]),
+            board_size=int(value["board_size"]),
+            komi_twice=int(value["komi_twice"]),
+            handicap=int(value["handicap"]),
+            to_move=str(value["to_move"]),
+            outcome=str(value["outcome"]),
+            result=str(value.get("result", "")),
+            rules=str(value.get("rules", "japanese")),
+            black_player=str(value.get("black_player", "")),
+            white_player=str(value.get("white_player", "")),
+            event=str(value.get("event", "")),
+            date=str(value.get("date", "")),
+            setup_black=tuple(int(item) for item in value["setup_black"]),
+            setup_white=tuple(int(item) for item in value["setup_white"]),
+            setup_empty=tuple(int(item) for item in value["setup_empty"]),
+            moves=tuple(int(item) for item in value["moves"]),
+        )
+
     def to_json(self) -> dict[str, object]:
         return {
             "id": self.id,

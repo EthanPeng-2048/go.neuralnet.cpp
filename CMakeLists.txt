@@ -83,10 +83,21 @@ target_link_libraries(go_nngames PUBLIC go_rules PRIVATE neuralnet::nn)
 add_executable(go_data_cli src/go/data_cli.cpp)
 target_link_libraries(go_data_cli PRIVATE go_nngames go_katago_game neuralnet::nn)
 
+add_library(go_feature_cache STATIC src/go/feature_cache.cpp)
+target_include_directories(go_feature_cache PUBLIC include)
+
+add_executable(go_train_cli src/go/go_train_cli.cpp)
+target_link_libraries(
+    go_train_cli
+    PRIVATE go_feature_cache go_katago_game neuralnet::nn
+)
+
 include(CTest)
 if(BUILD_TESTING)
     add_test(NAME go_neuralnet_m0_smoke COMMAND go_neuralnet_m0)
     set_tests_properties(go_neuralnet_m0_smoke PROPERTIES TIMEOUT 30)
+    add_test(NAME go_train_cli_help COMMAND go_train_cli --help)
+    set_tests_properties(go_train_cli_help PROPERTIES TIMEOUT 30)
 
     if(TARGET layer_bench)
         add_test(NAME go_neuralnet_m0_layer_bench_help COMMAND layer_bench --help)
