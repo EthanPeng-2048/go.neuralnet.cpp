@@ -77,7 +77,7 @@ set_target_properties(go_katago_game PROPERTIES
 )
 unset(_go_katago_root)
 
-add_library(go_rules STATIC src/go/game.cpp)
+add_library(go_rules STATIC src/go/game.cpp src/go/features.cpp)
 target_include_directories(go_rules PUBLIC include)
 target_link_libraries(go_rules PRIVATE go_katago_game)
 
@@ -103,6 +103,26 @@ if(WIN32)
     # default executable stack is also about 1 MiB, so model integrity checks
     # overflow before the loader can read the first parameter.
     target_link_options(go_train_cli PRIVATE "LINKER:/STACK:8388608")
+endif()
+
+# M6: the policy player wires a loaded strategy model to KataGo rules
+# (features -> forward -> argmax over legal points). The GTP adapter and the
+# arena both build on it so their move selection is identical by construction.
+add_library(go_policy STATIC src/go/policy.cpp)
+target_link_libraries(go_policy PUBLIC go_rules go_katago_game neuralnet::nn)
+
+add_executable(go_gtp_cli src/go/go_gtp_cli.cpp)
+target_link_libraries(go_gtp_cli PRIVATE go_policy)
+if(WIN32)
+    target_link_options(go_gtp_cli PRIVATE "LINKER:/STACK:8388608")
+endif()
+
+# M6: the arena plays batches of games between two engines (random / model /
+# external GTP subprocess) and applies an SPRT win-rate test to the player.
+add_executable(go_arena_cli src/go/go_arena_cli.cpp)
+target_link_libraries(go_arena_cli PRIVATE go_policy)
+if(WIN32)
+    target_link_options(go_arena_cli PRIVATE "LINKER:/STACK:8388608")
 endif()
 
 include(CTest)
@@ -154,6 +174,47 @@ if(BUILD_TESTING)
         set_tests_properties(go_pipeline_m2_m3_tests PROPERTIES
             TIMEOUT 60
             ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_data_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+        # M5: resume equivalence (2+2 epochs == 4 straight), dataset identity
+        # gates, per-epoch metrics JSONL, and dual-role checkpoint artifacts.
+        add_test(
+            NAME go_trainer_m5_resume
+            COMMAND "${GO_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_m5_resume.py"
+        )
+        set_tests_properties(go_trainer_m5_resume PROPERTIES
+            TIMEOUT 300
+            ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_train_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+        # M6: the C++ live feature extractor must match the Python trainer
+        # bitwise, or GTP play would feed the network different inputs than
+        # training saw.
+        add_test(
+            NAME go_features_m6_parity
+            COMMAND "${GO_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_m6_features.py"
+        )
+        set_tests_properties(go_features_m6_parity PROPERTIES
+            TIMEOUT 60
+            ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_rules_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+        # M6: GTP adapter protocol behavior + arena engines + SPRT math.
+        add_test(
+            NAME go_gtp_arena_m6
+            COMMAND "${GO_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_m6_gtp_arena.py"
+        )
+        set_tests_properties(go_gtp_arena_m6 PROPERTIES
+            TIMEOUT 600
+            ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_gtp_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+        # v2 cache: the per-sample move history must match the Python
+        # tokenizer frame by frame, and a v1 cache must be refused rather than
+        # silently substituted with zeros.
+        add_test(
+            NAME go_feature_cache_history
+            COMMAND "${GO_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_feature_cache_history.py"
+        )
+        set_tests_properties(go_feature_cache_history PROPERTIES
+            TIMEOUT 120
+            ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_train_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
         )
     endif()
     find_program(GNUGO_EXECUTABLE gnugo)

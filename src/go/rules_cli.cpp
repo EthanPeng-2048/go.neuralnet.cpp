@@ -1,6 +1,8 @@
 #include "go/game.hpp"
+#include "go/features.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <cctype>
 #include <cstdlib>
@@ -155,7 +157,8 @@ void print_usage(const char* program) {
         << " replay [--size N] [--rules chinese|japanese] [--komi K] [--tolerant] "
            "COLOR:X,Y|COLOR:pass ...\n"
         << "       " << program << " trace --input JSON\n"
-        << "       " << program << " trace-batch --input JSONL\n";
+        << "       " << program << " trace-batch --input JSONL\n"
+        << "       " << program << " features --input JSON\n";
 }
 
 int run_replay(int argc, char** argv) {
@@ -404,6 +407,80 @@ int run_trace_batch(int argc, char** argv) {
     return 0;
 }
 
+// M6 特征对拍：与 trace 相同的请求 JSON，但输出每一帧的 9×19×19 特征
+// （小端 float32 的 hex），供 tests/test_m6_features.py 与 Python
+// extract_features 逐位比对。hex 比 JSON 浮点更严格——不做十进制往返。
+nlohmann::json features_request(const nlohmann::json& request) {
+    const nlohmann::json traced = trace_request(request, true);
+    const nlohmann::json& frames = traced.at("frames");
+
+    // 重放同一局以获得逐帧的 go::Game（trace_request 不暴露 C++ 状态）。
+    const std::string rules_name = required_json_string(request, "rules");
+    const float komi = request.value("komi", 7.5F);
+    const go::Stone to_move = parse_stone_name(required_json_string(request, "to_move"));
+
+    std::string rows;
+    const nlohmann::json& rows_it = request.at("rows");
+    for (std::size_t i = 0; i < rows_it.size(); ++i) {
+        if (i != 0) {
+            rows.push_back('\n');
+        }
+        rows += rows_it[i].get<std::string>();
+    }
+    go::Game game = go::Game::from_ascii(rows, to_move, rule_set_from(rules_name, komi));
+
+    std::vector<float> buffer(go::feature_element_count);
+    nlohmann::json planes = nlohmann::json::array();
+    auto emit = [&](const go::Game& current) {
+        go::extract_features(current, buffer);
+        static const char* digits = "0123456789abcdef";
+        std::string hex;
+        hex.reserve(buffer.size() * 2 * sizeof(float));
+        for (float value : buffer) {
+            const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+            for (unsigned shift = 0; shift < 32; shift += 8) {  // 小端字节序
+                const std::uint32_t byte = (bits >> shift) & 0xFF;
+                hex.push_back(digits[byte >> 4]);
+                hex.push_back(digits[byte & 0xF]);
+            }
+        }
+        planes.push_back(std::move(hex));
+    };
+    emit(game);
+
+    const auto moves_it = request.find("moves");
+    if (moves_it != request.end()) {
+        for (const nlohmann::json& item : *moves_it) {
+            const go::Stone color = parse_stone_name(required_json_string(item, "color"));
+            std::optional<go::Point> point;
+            const auto point_it = item.find("point");
+            if (point_it != item.end() && !point_it->is_null()) {
+                point = go::Point{
+                    (*point_it)[0].get<int>(),
+                    (*point_it)[1].get<int>(),
+                };
+            }
+            if (!game.play_tolerant(color, point)) {
+                throw std::runtime_error("features move was rejected");
+            }
+            emit(game);
+        }
+    }
+    if (planes.size() != frames.size()) {
+        throw std::runtime_error("features frame count mismatch");
+    }
+    return nlohmann::json{{"planes_hex_le_f32", std::move(planes)}};
+}
+
+int run_features(int argc, char** argv) {
+    const TraceOptions options = parse_trace_options(argc, argv, "features");
+    const nlohmann::json request = nlohmann::json::parse(
+        read_text_input(options.input_path)
+    );
+    std::cout << features_request(request).dump() << '\n';
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -421,6 +498,9 @@ int main(int argc, char** argv) {
         }
         if (command == "trace-batch") {
             return run_trace_batch(argc, argv);
+        }
+        if (command == "features") {
+            return run_features(argc, argv);
         }
         print_usage(argv[0]);
         return 2;

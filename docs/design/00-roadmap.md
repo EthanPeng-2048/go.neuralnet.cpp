@@ -158,8 +158,8 @@ visits **数目**是可谈判条款（§2，40–100 已有实质战力——先
 | **M2** ✅ | 数据下载器 + SGF 解析 + `.nngames` | 1 万局入库，随机回放验证可逆 | M1 |
 | **M3** ✅ | `GoTokenizer` + 特征平面（19×19 特化） | 任意局面 → 特征张量，可视化自检 | M1 |
 | **M4** ✅ | **C 验证器竖切**（见 §4 DoD） | 全链路 + loss 下降 + ckpt 往返 + 评估可复现 | M2,M3 |
-| **M5** | `GoTrainer` 正式版：`--resume`、指标落盘、双角色存取 | 断点续训无损；监督配方可 CLI 表达 | M4 |
-| **M6** | GTP 适配器 + Arena（SPRT） | Sabaki 亲手可下；vs GnuGo 自动评估 | M1,M5 |
+| **M5** ✅ | `GoTrainer` 正式版：`--resume`、指标落盘、双角色存取 | 断点续训无损；监督配方可 CLI 表达 | M4 |
+| **M6** ✅ | GTP 适配器 + Arena（SPRT） | Sabaki 亲手可下；vs GnuGo 自动评估 | M1,M5 |
 | **M7** | **B 架构**替换 C（复合层 + 双头 + GoLoss + 合法性掩码） | 同数据显著优于 C；存盘/续训无损；推理速度 ≥ 预算（§7） | M5 |
 | **M8** | **MCTS 推理引擎**（PUCT / 先验归一化 / 合法性 / 转置表；**只搜索不训练**——自对局训练循环随 D9 移出） | 9×9 沙盒（D2 允许）：vs 方案 1 纯先验显著增益；vs GnuGo 胜率达标；19×19 速度 ≥ §7 预算 | M6,M7 |
 | **M9** | 监督 10–30 万局正式训练 + 按赌约条件对 KataGo/对手调参（**无自对局微调**，D9） | 按赌约条件的正式评估达标 | M8 |
@@ -231,6 +231,35 @@ visits **数目**是可谈判条款（§2，40–100 已有实质战力——先
   1 MiB 栈缓冲与 Windows 默认线程栈冲突导致的模型校验溢出。
 - 完整数据和命令见 [`M4 验收`](../benchmarks/m4-c-validator.md)；格式见
   [`09-training-cache.md`](09-training-cache.md)。
+
+### 6.6 M5 执行记录（2026-10-24）
+
+- ✅ `--resume` 断点续训：`.nnckpt` 携带 TrainState（计数器/配方/数据集
+  身份）+ 优化器状态张量；续训恢复优化器 m/v/t 与 lr 曲线位置。
+- ✅ **续训无损在真实 CWI 数据上逐位验证**：2+2 epoch 与一口气 4 epoch
+  的 epoch 3/4 train/eval loss 与 top-1 完全相等（非四舍五入相等）。
+- ✅ 指标按 epoch 追加 JSONL（`--metrics-log`），跨进程续写同一文件；
+  checkpoint 写在 epoch 边界，崩溃最多丢一个 epoch。
+- ✅ 双角色：`.nnckpt`（3.0× 大小，含 16 个优化器张量）vs `.nnmodel`
+  （纯推理）；`.nnmodel` 不能当断点（角色门禁硬错）。
+- ✅ 监督配方 CLI 全表达（optimizer/schedule/beta/clip/warmup）并随断点
+  落盘；换数据集或改 `--epochs` 续训被身份门禁硬错拒绝。
+- 完整数据和命令见 [`M5 验收`](../benchmarks/m5-trainer.md)。
+
+### 6.7 M6 执行记录（2026-10-24）
+
+- ✅ C++ 实时特征提取（`go/features.hpp`）与 Python 训练管线**逐位一致**
+  （4 组对局全帧 float32 比对通过，含提子/ko/pass 占位/长局）。
+- ✅ GTP v2 适配器（`go_gtp_cli`）：GUI 所需命令全覆盖，genmove 在
+  KataGo 合法着上取模型 argmax，错误走 `? ` 前缀；规则全部复用 KataGo。
+- ✅ Arena（`go_arena_cli`）：random / model / 外部 GTP 子进程三种引擎，
+  颜色逐局轮换，SPRT（二项 LLR + α/β 边界）越界早停。
+- ✅ 实测：M5 训出的 C 验证器 vs random 19×19 四局 3 胜，SPRT 判定
+  `continue` 正确；GTP 子进程对手路径用自有 `go_gtp_cli` 验证
+  （play 转发 + genmove 解析）。
+- GnuGo 对评估以 `--opponent "gtp:gnugo --mode gtp --quiet"` 接入；
+  本机未装 gnugo，测试自动跳过（同 M1 语义）。
+- 完整数据和命令见 [`M6 验收`](../benchmarks/m6-gtp-arena.md)。
 
 ## 7. 算力预算（推导口径，M0 用实测替换）
 

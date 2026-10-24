@@ -20,7 +20,7 @@ from .features import (
 )
 from .model import GameRecord
 from .tokenizer import GoTokenizer
-from .training import build_training_caches
+from .training import DEFAULT_HISTORY_LEN, build_training_caches
 
 
 def default_root() -> Path:
@@ -173,6 +173,7 @@ def cmd_training_cache(args: argparse.Namespace) -> None:
         max_games=args.max_games,
         eval_games=args.eval_games,
         seed=args.seed,
+        history_len=args.history_len,
     )
     if args.manifest:
         manifest_path = Path(args.manifest).resolve()
@@ -236,6 +237,9 @@ def parser() -> argparse.ArgumentParser:
     cache.add_argument("--max-games", type=int, default=1000)
     cache.add_argument("--eval-games", type=int, default=100)
     cache.add_argument("--seed", type=int, default=20261024)
+    # M7: per-sample move history for the B model's history branch (K slots,
+    # left <pad>-padded). Must match the model's --history-len at train time.
+    cache.add_argument("--history-len", type=int, default=DEFAULT_HISTORY_LEN)
     cache.set_defaults(func=cmd_training_cache)
     return result
 

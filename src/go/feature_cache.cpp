@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace go {
 namespace {
@@ -18,6 +19,7 @@ struct CacheHeader {
     std::uint64_t record_count;
     std::uint32_t feature_count;
     std::uint32_t board_size;
+    // v1：全零保留；v2：起始处 u32 history_len + u32 history_vocab，其余为零。
     std::uint8_t reserved[24];
 };
 
@@ -38,9 +40,9 @@ static_assert(sizeof(CacheHeader) == feature_cache_header_size);
 static_assert(sizeof(CacheRecordHeader) == 24);
 static_assert(sizeof(CacheRecordHeader) + feature_plane_count *
               training_board_size * training_board_size * sizeof(float) ==
-              feature_cache_record_size);
+              feature_cache_record_size_v1);
 static_assert(std::endian::native == std::endian::little,
-              "NGFEAT01 v1 is little-endian");
+              "NGFEAT01 is little-endian");
 
 std::string checked_path(const std::filesystem::path& path) {
     return path.string();
@@ -54,14 +56,22 @@ FeatureCache::FeatureCache(
     std::uint64_t data_offset,
     std::size_t feature_count,
     std::uint32_t board_size,
-    std::size_t sample_count
+    std::size_t sample_count,
+    std::uint32_t format_version,
+    std::uint32_t history_len,
+    std::uint32_t history_vocab,
+    std::uint32_t record_stride
 )
     : path_(std::move(path)),
       stream_(std::move(stream)),
       data_offset_(data_offset),
       feature_count_(feature_count),
       board_size_(board_size),
-      sample_count_(sample_count) {}
+      sample_count_(sample_count),
+      format_version_(format_version),
+      history_len_(history_len),
+      history_vocab_(history_vocab),
+      record_stride_(record_stride) {}
 
 FeatureCache FeatureCache::open(const std::filesystem::path& path) {
     std::ifstream stream(path, std::ios::binary);
@@ -77,7 +87,8 @@ FeatureCache FeatureCache::open(const std::filesystem::path& path) {
     if (std::memcmp(header.magic, feature_cache_magic.data(), sizeof(header.magic)) != 0) {
         throw std::runtime_error("invalid feature cache magic: " + checked_path(path));
     }
-    if (header.version != feature_cache_version) {
+    if (header.version != feature_cache_version &&
+        header.version != feature_cache_version_legacy) {
         throw std::runtime_error(
             "unsupported feature cache version " + std::to_string(header.version)
         );
@@ -96,9 +107,31 @@ FeatureCache FeatureCache::open(const std::filesystem::path& path) {
         header.record_count > std::numeric_limits<std::size_t>::max()) {
         throw std::runtime_error("invalid feature cache record count");
     }
+
+    // v2：历史长度/词表从头 reserved（offset 32）读取；v1 恒为零历史。
+    std::uint32_t history_len = 0;
+    std::uint32_t history_vocab = 0;
+    std::uint32_t stride = feature_cache_record_size_v1;
+    if (header.version == feature_cache_version) {
+        std::memcpy(&history_len, header.reserved + 0, sizeof(history_len));
+        std::memcpy(&history_vocab, header.reserved + 4, sizeof(history_vocab));
+        if (history_len == 0 || history_len > 1024) {
+            throw std::runtime_error(
+                "feature cache v2 has invalid history length " +
+                std::to_string(history_len));
+        }
+        if (history_vocab < feature_cache_history_vocab) {
+            throw std::runtime_error(
+                "feature cache v2 history vocab " + std::to_string(history_vocab) +
+                " smaller than GoTokenizer vocab " +
+                std::to_string(feature_cache_history_vocab));
+        }
+        stride = feature_cache_record_size_v2(history_len);
+    }
+
     const std::uint64_t expected_size =
         feature_cache_header_size +
-        header.record_count * static_cast<std::uint64_t>(feature_cache_record_size);
+        header.record_count * static_cast<std::uint64_t>(stride);
     const std::uint64_t actual_size = std::filesystem::file_size(path);
     if (actual_size != expected_size) {
         throw std::runtime_error(
@@ -113,7 +146,11 @@ FeatureCache FeatureCache::open(const std::filesystem::path& path) {
         feature_cache_header_size,
         header.feature_count,
         header.board_size,
-        static_cast<std::size_t>(header.record_count)
+        static_cast<std::size_t>(header.record_count),
+        header.version,
+        history_len,
+        history_vocab,
+        stride
     );
 }
 
@@ -122,7 +159,7 @@ FeatureSampleMeta FeatureCache::read_header(std::size_t index) {
         throw std::out_of_range("feature cache sample index outside range");
     }
     const std::uint64_t offset =
-        data_offset_ + static_cast<std::uint64_t>(index) * feature_cache_record_size;
+        data_offset_ + static_cast<std::uint64_t>(index) * record_stride_;
     stream_.clear();
     stream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     CacheRecordHeader record{};
@@ -153,18 +190,39 @@ void FeatureCache::read_planes(std::size_t index, std::span<float> output) {
 void FeatureCache::read_sample(
     std::size_t index,
     std::span<float> output,
-    FeatureSampleMeta* metadata
+    FeatureSampleMeta* metadata,
+    std::span<std::uint16_t> history
 ) {
     if (output.size() != feature_count_) {
         throw std::invalid_argument("feature cache output span has wrong size");
+    }
+    if (!history.empty() && history.size() != history_len_) {
+        throw std::invalid_argument(
+            "feature cache history span has wrong size: cache v" +
+            std::to_string(format_version_) + " K=" +
+            std::to_string(history_len_) + ", got " + std::to_string(history.size())
+        );
     }
     const FeatureSampleMeta value = read_header(index);
     if (metadata != nullptr) {
         *metadata = value;
     }
-    const std::uint64_t offset =
-        data_offset_ + static_cast<std::uint64_t>(index) * feature_cache_record_size +
-        sizeof(CacheRecordHeader);
+    const std::uint64_t base =
+        data_offset_ + static_cast<std::uint64_t>(index) * record_stride_;
+    // 布局 v2：[meta 24B][history u16×K][planes]；v1 无历史段。
+    std::uint64_t offset = base + sizeof(CacheRecordHeader);
+    if (!history.empty()) {
+        stream_.clear();
+        stream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        stream_.read(
+            reinterpret_cast<char*>(history.data()),
+            static_cast<std::streamsize>(history.size_bytes())
+        );
+        if (stream_.gcount() != static_cast<std::streamsize>(history.size_bytes())) {
+            throw std::runtime_error("truncated feature cache history");
+        }
+        offset += history.size_bytes();
+    }
     stream_.clear();
     stream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     if (!stream_) {
