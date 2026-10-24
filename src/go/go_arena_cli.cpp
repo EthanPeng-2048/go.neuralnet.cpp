@@ -40,6 +40,7 @@
 #include "go/policy.hpp"
 
 #if defined(_WIN32)
+#include <fcntl.h>   // _O_TEXT（_fdopen 的翻译模式）
 #include <io.h>
 #include <process.h>
 #include <windows.h>
