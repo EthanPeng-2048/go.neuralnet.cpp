@@ -1,6 +1,6 @@
 # go.neuralnet.cpp 设计与路线图
 
-> 状态：**v0.10**（2026-10-24）· v0.4：范围裁定不做 RL（D9）+ 方案 1/2 文档；
+> 状态：**v0.11**（2026-10-24）· v0.4：范围裁定不做 RL（D9）+ 方案 1/2 文档；
 > v0.5：**方案 3（搜索控制 Token 蒸馏）落档**——算法/实践分离
 > （[05 算法](05-scheme3-algorithm.md) / [06 实践](06-scheme3-engineering.md)）、
 > D3 V100 实测修订、**D10 立项**；
@@ -8,7 +8,8 @@
 > v0.7：**M0 工程与 40HX 基准完成**；M1 裁定为直接消费 KataGo 棋规库，不自行实现规则；
 > v0.8：**M0 按公开 4060/KataGo 基准近似闭合**，进入 M1；
 > v0.9：**M1 KataGo 棋规适配完成**：题库、SGF 回放、GnuGo 对拍与性能闸门通过；
-> v0.10：**M2/M3 完成**：1 万局 `.nngames`、GoTokenizer、9 平面特征与可视化验收
+> v0.10：**M2/M3 完成**：1 万局 `.nngames`、GoTokenizer、9 平面特征与可视化验收；
+> v0.11：**M4 完成**：C 验证器在 CMP 40HX 上完成 4 epoch、可复现评估与零差异存取
 > 上游库：[`neuralnet.cpp` `v1.12.0`](https://github.com/EthanPeng-2048/neuralnet.cpp/tree/v1.12.0)
 > （C++26 header-only，CPU/Vulkan 双后端，无 CUDA；完整锁定信息见
 > [DEPENDENCIES.md](../../DEPENDENCIES.md)）
@@ -156,7 +157,7 @@ visits **数目**是可谈判条款（§2，40–100 已有实质战力——先
 | **M1** ✅ | **KataGo 棋规适配层**（D11，不自研规则） | 捕提子题库 + TT 数子用例全绿；单局重放 <5ms；与 GnuGo 交叉核对一致 | KataGo `v1.18.2` |
 | **M2** ✅ | 数据下载器 + SGF 解析 + `.nngames` | 1 万局入库，随机回放验证可逆 | M1 |
 | **M3** ✅ | `GoTokenizer` + 特征平面（19×19 特化） | 任意局面 → 特征张量，可视化自检 | M1 |
-| **M4** | **C 验证器竖切**（见 §4 DoD） | 全链路 + loss 下降 + ckpt 往返 + 评估可复现 | M2,M3 |
+| **M4** ✅ | **C 验证器竖切**（见 §4 DoD） | 全链路 + loss 下降 + ckpt 往返 + 评估可复现 | M2,M3 |
 | **M5** | `GoTrainer` 正式版：`--resume`、指标落盘、双角色存取 | 断点续训无损；监督配方可 CLI 表达 | M4 |
 | **M6** | GTP 适配器 + Arena（SPRT） | Sabaki 亲手可下；vs GnuGo 自动评估 | M1,M5 |
 | **M7** | **B 架构**替换 C（复合层 + 双头 + GoLoss + 合法性掩码） | 同数据显著优于 C；存盘/续训无损；推理速度 ≥ 预算（§7） | M5 |
@@ -217,6 +218,19 @@ visits **数目**是可谈判条款（§2，40–100 已有实质战力——先
   [`PNG`](../benchmarks/m3-feature-planes.png) 与
   [`NumPy 张量`](../benchmarks/m3-feature-planes.npy)。
   格式见 [`08-data-and-features.md`](08-data-and-features.md)。
+
+### 6.5 M4 执行记录（2026-10-24）
+
+- ✅ Python 批量导出与 KataGo `trace-batch` 生成版本化 `.ngf` 缓存：
+  900 局训练 / 100 局验证，187,432 / 20,367 个局面。
+- ✅ 40HX 上完成 C 验证器 4 epoch 训练，所有 loss 有限；validation
+  loss `6.031 → 4.354`，policy top-1 `0.30% → 10.22%`。
+- ✅ 独立评估重复运行的 loss、样本数和 top-1 完全一致，仅绝对耗时变化。
+- ✅ `.nnckpt` 与 `.nnmodel` 保存加载后的 logits 最大绝对差均为 `0.0`。
+- ✅ 修复 Windows 下 KataGo 字节序/`ws2_32` 构建问题，以及 neuralnet.cpp
+  1 MiB 栈缓冲与 Windows 默认线程栈冲突导致的模型校验溢出。
+- 完整数据和命令见 [`M4 验收`](../benchmarks/m4-c-validator.md)；格式见
+  [`09-training-cache.md`](09-training-cache.md)。
 
 ## 7. 算力预算（推导口径，M0 用实测替换）
 

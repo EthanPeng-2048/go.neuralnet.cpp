@@ -138,12 +138,12 @@ def batch_columns(samples: list[FeatureSample]) -> np.ndarray:
     return np.stack([sample.flatten_nn() for sample in samples], axis=1)
 
 
-def trace_record(record: GameRecord, rules_cli: Path) -> dict[str, object]:
+def trace_request(record: GameRecord) -> dict[str, object]:
     moves = []
     for token in record.moves:
         color, point = decode_move(token)
         moves.append({"color": color, "point": None if point is None else list(point)})
-    request = {
+    return {
         "size": record.board_size,
         "rules": record.rules,
         "komi": record.komi_twice / 2,
@@ -151,14 +151,35 @@ def trace_record(record: GameRecord, rules_cli: Path) -> dict[str, object]:
         "rows": record.initial_rows(),
         "moves": moves,
     }
+
+
+def trace_records(
+    records: list[GameRecord],
+    rules_cli: Path,
+) -> list[dict[str, object]]:
+    if not records:
+        return []
+    payload = "".join(
+        json.dumps(trace_request(record), separators=(",", ":")) + "\n"
+        for record in records
+    )
     result = subprocess.run(
-        [str(rules_cli), "trace", "--input", "-"],
-        input=json.dumps(request),
+        [str(rules_cli), "trace-batch", "--input", "-"],
+        input=payload,
         text=True,
         check=True,
         capture_output=True,
     )
-    return json.loads(result.stdout)
+    traces = [json.loads(line) for line in result.stdout.splitlines() if line]
+    if len(traces) != len(records):
+        raise RuntimeError(
+            f"trace-batch returned {len(traces)} results for {len(records)} records"
+        )
+    return traces
+
+
+def trace_record(record: GameRecord, rules_cli: Path) -> dict[str, object]:
+    return trace_records([record], rules_cli)[0]
 
 
 def sample_from_trace(

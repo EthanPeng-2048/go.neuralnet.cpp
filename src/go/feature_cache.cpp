@@ -54,14 +54,14 @@ FeatureCache::FeatureCache(
     std::uint64_t data_offset,
     std::size_t feature_count,
     std::uint32_t board_size,
-    std::vector<FeatureSampleMeta> samples
+    std::size_t sample_count
 )
     : path_(std::move(path)),
       stream_(std::move(stream)),
       data_offset_(data_offset),
       feature_count_(feature_count),
       board_size_(board_size),
-      samples_(std::move(samples)) {}
+      sample_count_(sample_count) {}
 
 FeatureCache FeatureCache::open(const std::filesystem::path& path) {
     std::ifstream stream(path, std::ios::binary);
@@ -107,62 +107,61 @@ FeatureCache FeatureCache::open(const std::filesystem::path& path) {
         );
     }
 
-    std::vector<FeatureSampleMeta> samples;
-    samples.reserve(static_cast<std::size_t>(header.record_count));
-    for (std::uint64_t index = 0; index < header.record_count; ++index) {
-        CacheRecordHeader record{};
-        stream.read(reinterpret_cast<char*>(&record), sizeof(record));
-        if (!stream) {
-            throw std::runtime_error("truncated feature cache record header");
-        }
-        if (record.target >= policy_class_count) {
-            throw std::runtime_error(
-                "feature cache target outside policy classes at row " +
-                std::to_string(index)
-            );
-        }
-        if (record.value < -1 || record.value > 1) {
-            throw std::runtime_error(
-                "feature cache value outside [-1,1] at row " + std::to_string(index)
-            );
-        }
-        samples.push_back({
-            record.sample_id,
-            record.game_index,
-            record.move_number,
-            record.target,
-            record.value,
-            record.flags,
-        });
-        const std::uint64_t planes_bytes =
-            static_cast<std::uint64_t>(header.feature_count) * sizeof(float);
-        stream.seekg(static_cast<std::streamoff>(planes_bytes), std::ios::cur);
-        if (!stream) {
-            throw std::runtime_error("feature cache is truncated");
-        }
-    }
     return FeatureCache(
         path,
         std::move(stream),
         feature_cache_header_size,
         header.feature_count,
         header.board_size,
-        std::move(samples)
+        static_cast<std::size_t>(header.record_count)
     );
 }
 
-const FeatureSampleMeta& FeatureCache::meta(std::size_t index) const {
-    if (index >= samples_.size()) {
+FeatureSampleMeta FeatureCache::read_header(std::size_t index) {
+    if (index >= sample_count_) {
         throw std::out_of_range("feature cache sample index outside range");
     }
-    return samples_[index];
+    const std::uint64_t offset =
+        data_offset_ + static_cast<std::uint64_t>(index) * feature_cache_record_size;
+    stream_.clear();
+    stream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    CacheRecordHeader record{};
+    stream_.read(reinterpret_cast<char*>(&record), sizeof(record));
+    if (!stream_) {
+        throw std::runtime_error("truncated feature cache record header");
+    }
+    if (record.target >= policy_class_count) {
+        throw std::runtime_error("feature cache target outside policy classes");
+    }
+    if (record.value < -1 || record.value > 1) {
+        throw std::runtime_error("feature cache value outside [-1,1]");
+    }
+    return {
+        record.sample_id,
+        record.game_index,
+        record.move_number,
+        record.target,
+        record.value,
+        record.flags,
+    };
 }
 
 void FeatureCache::read_planes(std::size_t index, std::span<float> output) {
+    read_sample(index, output);
+}
+
+void FeatureCache::read_sample(
+    std::size_t index,
+    std::span<float> output,
+    FeatureSampleMeta* metadata
+) {
     if (output.size() != feature_count_) {
         throw std::invalid_argument("feature cache output span has wrong size");
     }
-    (void)meta(index);
+    const FeatureSampleMeta value = read_header(index);
+    if (metadata != nullptr) {
+        *metadata = value;
+    }
     const std::uint64_t offset =
         data_offset_ + static_cast<std::uint64_t>(index) * feature_cache_record_size +
         sizeof(CacheRecordHeader);
@@ -178,6 +177,10 @@ void FeatureCache::read_planes(std::size_t index, std::span<float> output) {
     if (stream_.gcount() != static_cast<std::streamsize>(output.size_bytes())) {
         throw std::runtime_error("truncated feature cache sample");
     }
+}
+
+FeatureSampleMeta FeatureCache::meta(std::size_t index) {
+    return read_header(index);
 }
 
 }  // namespace go

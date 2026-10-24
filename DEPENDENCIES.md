@@ -34,6 +34,10 @@ add_subdirectory(3rd_party/neuralnet.cpp)
 target_link_libraries(my_app PRIVATE neuralnet::nn)
 ```
 
+Windows 项目侧兼容：`go_train_cli` 链接 8 MiB 栈。neuralnet.cpp v1.12.0 的流式
+SHA-256 使用 1 MiB 栈缓冲，而 Windows 默认线程栈约 1 MiB；该设置只解决模型
+完整性校验的栈溢出，不修改 submodule 源码。
+
 ## 为什么锁定 v1.12.0
 
 - v1.12.0 正式发布 RL 与可组合训练基础设施；此前“等上游 RL 原语”的阻塞已解除。

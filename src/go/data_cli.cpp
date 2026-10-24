@@ -365,6 +365,36 @@ int export_game(int argc, char** argv) {
     return 0;
 }
 
+int export_range(int argc, char** argv) {
+    std::string path;
+    std::size_t start = 0;
+    std::size_t limit = 0;
+    for (int i = 2; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        if (arg == "--input") {
+            path = option_value(i, argc, argv);
+        } else if (arg == "--start") {
+            start = static_cast<std::size_t>(std::stoull(option_value(i, argc, argv)));
+        } else if (arg == "--limit") {
+            limit = static_cast<std::size_t>(std::stoull(option_value(i, argc, argv)));
+        } else {
+            throw std::invalid_argument("unknown export-range option: " + std::string(arg));
+        }
+    }
+    if (path.empty() || limit == 0) {
+        throw std::invalid_argument("export-range requires --input and --limit");
+    }
+    const go::GameDataset dataset = go::load_nngames(path);
+    if (start >= dataset.games.size()) {
+        throw std::out_of_range("export-range start outside dataset");
+    }
+    const std::size_t end = std::min(dataset.games.size(), start + limit);
+    for (std::size_t index = start; index < end; ++index) {
+        std::cout << record_json(dataset.games[index]).dump() << '\n';
+    }
+    return 0;
+}
+
 std::string vocab_option_output(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--output") {
@@ -473,6 +503,7 @@ void usage(const char* program) {
         << "  " << program << " stats --input FILE\n"
         << "  " << program << " verify --input FILE [--sample N --seed S]\n"
         << "  " << program << " export --input FILE --index N\n"
+        << "  " << program << " export-range --input FILE [--start N] --limit N\n"
         << "  " << program << " write-vocab --output FILE\n"
         << "  " << program << " inspect-vocab --input FILE\n";
 }
@@ -497,6 +528,9 @@ int main(int argc, char** argv) {
         }
         if (command == "export") {
             return export_game(argc, argv);
+        }
+        if (command == "export-range") {
+            return export_range(argc, argv);
         }
         if (command == "write-vocab") {
             return write_vocab(argc, argv);

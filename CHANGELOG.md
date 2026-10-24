@@ -16,10 +16,14 @@ semantic versioning once public model or data formats are declared stable.
   replay verification.
 - `GoTokenizer`, `.nnvocab` export, nine feature planes, scalar features, and
   feature visualization.
+- Python-built versioned `.ngf` training caches with single-process bulk export
+  and KataGo trace.
+- The M4 C validator CLI, four-epoch policy training, reproducible evaluation,
+  and exact `.nnckpt`/`.nnmodel` round-trip validation on a CMP 40HX.
 
 ### Known limitations
 
-- M4 onward is not implemented.
+- M5 onward is not implemented.
 - The RTX 4060 visits rate is a public-data estimate, not a local measurement.
 - Generated datasets, tokenizers, and model artifacts are intentionally
   excluded from Git.

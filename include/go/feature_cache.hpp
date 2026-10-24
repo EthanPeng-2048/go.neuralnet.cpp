@@ -7,7 +7,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace go {
 
@@ -32,11 +31,16 @@ class FeatureCache {
 public:
     static FeatureCache open(const std::filesystem::path& path);
 
-    [[nodiscard]] std::size_t size() const noexcept { return samples_.size(); }
+    [[nodiscard]] std::size_t size() const noexcept { return sample_count_; }
     [[nodiscard]] std::size_t feature_count() const noexcept { return feature_count_; }
     [[nodiscard]] std::uint32_t board_size() const noexcept { return board_size_; }
-    [[nodiscard]] const FeatureSampleMeta& meta(std::size_t index) const;
+    [[nodiscard]] FeatureSampleMeta meta(std::size_t index);
     void read_planes(std::size_t index, std::span<float> output);
+    void read_sample(
+        std::size_t index,
+        std::span<float> output,
+        FeatureSampleMeta* metadata = nullptr
+    );
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
 
 private:
@@ -46,7 +50,7 @@ private:
         std::uint64_t data_offset,
         std::size_t feature_count,
         std::uint32_t board_size,
-        std::vector<FeatureSampleMeta> samples
+        std::size_t sample_count
     );
 
     std::filesystem::path path_;
@@ -54,7 +58,9 @@ private:
     std::uint64_t data_offset_ = 0;
     std::size_t feature_count_ = 0;
     std::uint32_t board_size_ = 0;
-    std::vector<FeatureSampleMeta> samples_;
+    std::size_t sample_count_ = 0;
+
+    [[nodiscard]] FeatureSampleMeta read_header(std::size_t index);
 };
 
 }  // namespace go

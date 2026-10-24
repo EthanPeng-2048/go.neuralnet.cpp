@@ -154,7 +154,8 @@ void print_usage(const char* program) {
         << "usage: " << program
         << " replay [--size N] [--rules chinese|japanese] [--komi K] [--tolerant] "
            "COLOR:X,Y|COLOR:pass ...\n"
-        << "       " << program << " trace --input JSON\n";
+        << "       " << program << " trace --input JSON\n"
+        << "       " << program << " trace-batch --input JSONL\n";
 }
 
 int run_replay(int argc, char** argv) {
@@ -265,27 +266,7 @@ nlohmann::json frame_json(const go::Game& game) {
     };
 }
 
-int run_trace(int argc, char** argv) {
-    std::string input_path;
-    bool tolerant = true;
-    for (int i = 2; i < argc; ++i) {
-        const std::string_view arg = argv[i];
-        if (arg == "--input") {
-            if (++i >= argc) {
-                throw std::invalid_argument("--input requires a path or '-'");
-            }
-            input_path = argv[i];
-        } else if (arg == "--strict") {
-            tolerant = false;
-        } else {
-            throw std::invalid_argument("unknown trace option: " + std::string(arg));
-        }
-    }
-    if (input_path.empty()) {
-        throw std::invalid_argument("trace requires --input");
-    }
-
-    const nlohmann::json request = nlohmann::json::parse(read_text_input(input_path));
+nlohmann::json trace_request(const nlohmann::json& request, bool tolerant) {
     const int size = required_json_int(request, "size");
     const std::string rules_name = required_json_string(request, "rules");
     const float komi = request.value("komi", 7.5F);
@@ -340,12 +321,86 @@ int run_trace(int argc, char** argv) {
         }
     }
 
-    std::cout << nlohmann::json{
+    return nlohmann::json{
         {"size", size},
         {"rules", rules_name},
         {"komi", komi},
         {"frames", std::move(frames)},
-    }.dump() << '\n';
+    };
+}
+
+struct TraceOptions {
+    std::string input_path;
+    bool tolerant = true;
+};
+
+TraceOptions parse_trace_options(int argc, char** argv, std::string_view command) {
+    TraceOptions options;
+    bool has_input = false;
+    for (int i = 2; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        if (arg == "--input") {
+            if (++i >= argc) {
+                throw std::invalid_argument("--input requires a path or '-'");
+            }
+            options.input_path = argv[i];
+            has_input = true;
+        } else if (arg == "--strict") {
+            options.tolerant = false;
+        } else {
+            throw std::invalid_argument(
+                "unknown " + std::string(command) + " option: " + std::string(arg)
+            );
+        }
+    }
+    if (!has_input) {
+        throw std::invalid_argument(std::string(command) + " requires --input");
+    }
+    return options;
+}
+
+int run_trace(int argc, char** argv) {
+    const TraceOptions options = parse_trace_options(argc, argv, "trace");
+    const nlohmann::json request = nlohmann::json::parse(
+        read_text_input(options.input_path)
+    );
+    std::cout << trace_request(request, options.tolerant).dump() << '\n';
+    return 0;
+}
+
+int run_trace_batch(int argc, char** argv) {
+    const TraceOptions options = parse_trace_options(argc, argv, "trace-batch");
+    std::ifstream file;
+    std::istream* input = &std::cin;
+    if (options.input_path != "-") {
+        file.open(options.input_path);
+        if (!file) {
+            throw std::runtime_error("cannot open trace-batch input: " + options.input_path);
+        }
+        input = &file;
+    }
+
+    std::string line;
+    std::size_t line_number = 0;
+    while (std::getline(*input, line)) {
+        ++line_number;
+        if (line.empty()) {
+            continue;
+        }
+        try {
+            std::cout << trace_request(
+                nlohmann::json::parse(line),
+                options.tolerant
+            ).dump() << '\n';
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                "trace-batch line " + std::to_string(line_number) + ": " + error.what()
+            );
+        }
+    }
+    if (input->bad()) {
+        throw std::runtime_error("failed while reading trace-batch input");
+    }
     return 0;
 }
 
@@ -363,6 +418,9 @@ int main(int argc, char** argv) {
         }
         if (command == "trace") {
             return run_trace(argc, argv);
+        }
+        if (command == "trace-batch") {
+            return run_trace_batch(argc, argv);
         }
         print_usage(argv[0]);
         return 2;

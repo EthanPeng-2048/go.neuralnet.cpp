@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "status": "pass",
+  "model": "c-validator-v1",
+  "dataset": "data/m4-c-train.ngf",
+  "eval_dataset": "data/m4-c-eval.ngf",
+  "engine": "vulkan",
+  "gpu_device": "40HX",
+  "seed": 20261024,
+  "epochs": 4,
+  "batch_size": 64,
+  "lr": 0.001,
+  "min_lr": 0.00001,
+  "weight_decay": 0.0001,
+  "train_samples": 187432,
+  "eval_samples": 20367,
+  "initial_eval": {
+    "loss": 6.030585765838623,
+    "top1": 0.0029950409976923454,
+    "samples": 20367,
+    "seconds": 2.8411782
+  },
+  "history": [
+    {
+      "epoch": 1,
+      "lr": 0.0010000000474974513,
+      "train_loss": 4.787182331085205,
+      "eval": {
+        "loss": 4.479490756988525,
+        "top1": 0.06431973290126185,
+        "samples": 20367,
+        "seconds": 2.8976172
+      },
+      "seconds": 82.8788825
+    },
+    {
+      "epoch": 2,
+      "lr": 0.0008550179773010314,
+      "train_loss": 4.370604515075684,
+      "eval": {
+        "loss": 4.378817081451416,
+        "top1": 0.0826336721166593,
+        "samples": 20367,
+        "seconds": 2.9496876
+      },
+      "seconds": 82.2348199
+    },
+    {
+      "epoch": 3,
+      "lr": 0.0005050000036135316,
+      "train_loss": 4.150167942047119,
+      "eval": {
+        "loss": 4.35141658782959,
+        "top1": 0.09559581676240977,
+        "samples": 20367,
+        "seconds": 2.8687633
+      },
+      "seconds": 81.8725576
+    },
+    {
+      "epoch": 4,
+      "lr": 0.00015498216089326888,
+      "train_loss": 3.941636800765991,
+      "eval": {
+        "loss": 4.353982925415039,
+        "top1": 0.10217508715078313,
+        "samples": 20367,
+        "seconds": 2.8668948
+      },
+      "seconds": 81.2858003
+    }
+  ],
+  "checkpoint": {
+    "max_logit_diff": 0.0,
+    "sha256": "ba60b790f70d9a72f4f6cc16c9a7f5f1d775c70151d517498c83eea6899aa054"
+  },
+  "inference_model": {
+    "max_logit_diff": 0.0,
+    "sha256": "1790215962d59d3344ca1b59af0aef3219f87be62bbbbac49ddbae6441d936d5"
+  },
+  "health": {
+    "loss_declined": true,
+    "checkpoint_roundtrip": true
+  },
+  "seconds": 328.43103
+}

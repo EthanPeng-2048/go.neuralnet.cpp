@@ -61,7 +61,14 @@ add_library(go_katago_game STATIC
 target_include_directories(go_katago_game PUBLIC "${_go_katago_root}/cpp")
 target_compile_definitions(go_katago_game PUBLIC COMPILE_MAX_BOARD_LEN=19)
 if(WIN32)
-    target_compile_definitions(go_katago_game PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(go_katago_game PRIVATE
+        NOMINMAX
+        _CRT_SECURE_NO_WARNINGS
+        LITTLE_ENDIAN=1234
+        BIG_ENDIAN=4321
+        BYTE_ORDER=LITTLE_ENDIAN
+    )
+    target_link_libraries(go_katago_game PUBLIC ws2_32)
 endif()
 set_target_properties(go_katago_game PROPERTIES
     CXX_STANDARD 17
@@ -91,6 +98,12 @@ target_link_libraries(
     go_train_cli
     PRIVATE go_feature_cache go_katago_game neuralnet::nn
 )
+if(WIN32)
+    # neuralnet.cpp's streaming SHA-256 uses a 1 MiB stack buffer. The Windows
+    # default executable stack is also about 1 MiB, so model integrity checks
+    # overflow before the loader can read the first parameter.
+    target_link_options(go_train_cli PRIVATE "LINKER:/STACK:8388608")
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
@@ -140,7 +153,7 @@ if(BUILD_TESTING)
         )
         set_tests_properties(go_pipeline_m2_m3_tests PROPERTIES
             TIMEOUT 60
-            ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+            ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_data_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
         )
     endif()
     find_program(GNUGO_EXECUTABLE gnugo)

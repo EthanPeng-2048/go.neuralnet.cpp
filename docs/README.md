@@ -11,6 +11,7 @@ with the dependency baseline before changing a third-party component.
 | [Roadmap and decisions](design/00-roadmap.md) | Scope, decisions, milestones, budgets, and open questions |
 | [Third-party selection](design/07-third-party-selection.md) | Responsibilities and boundaries of KataGo, neuralnet.cpp, and Python tools |
 | [Data and feature format](design/08-data-and-features.md) | `.nngames`, GoTokenizer, `.nnvocab`, and feature-plane contracts |
+| [M4 training cache](design/09-training-cache.md) | Versioned `.ngf` cache and C validator data flow |
 | [Dependencies](../DEPENDENCIES.md) | Exact versions, commits, licenses, and upgrade gates |
 | [Contributing](../CONTRIBUTING.md) | Build, test, dependency, and data-artifact rules |
 
@@ -26,6 +27,7 @@ with the dependency baseline before changing a third-party component.
 | [06-scheme3-engineering.md](design/06-scheme3-engineering.md) | Proposed | Engineering and teacher budget for scheme 3 |
 | [07-third-party-selection.md](design/07-third-party-selection.md) | Current | Library boundaries |
 | [08-data-and-features.md](design/08-data-and-features.md) | Current | Data and feature contracts |
+| [09-training-cache.md](design/09-training-cache.md) | Current | M4 `.ngf` cache format |
 
 Document 04 is intentionally absent. It was never created; numbering is kept
 stable so existing links do not change.
@@ -39,6 +41,7 @@ stable so existing links do not change.
 | [M0 Vulkan layers](benchmarks/m0-layer-bench-gpu.md) | CMP 40HX component benchmark |
 | [M1 rules](benchmarks/m1-rules.md) | Rule tests, replay, latency, and GnuGo cross-check |
 | [M2/M3 data and features](benchmarks/m2-m3-data.md) | Dataset counts, replay, round-trip, tokenizer, and feature evidence |
+| [M4 C validator](benchmarks/m4-c-validator.md) | Measured 40HX training, reproducibility, and model round-trip |
 
 ## Evidence labels
 

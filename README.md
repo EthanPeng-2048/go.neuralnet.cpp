@@ -4,7 +4,7 @@
 19×19 围棋训练与推理项目。模型、训练与 checkpoint 统一使用 neuralnet.cpp；
 棋规、SGF 和数据工程分别复用 KataGo、sgfmill 与 Python 生态。
 
-**当前状态：M0–M3 已完成，M4 尚未开始。**
+**当前状态：M0–M4 已完成，M5 尚未开始。**
 
 | 里程碑 | 状态 | 产物 |
 |---|---|---|
@@ -12,7 +12,7 @@
 | M1 棋规适配 | ✅ | KataGo v1.18.2 薄适配、规则题库、SGF 回放 |
 | M2 数据管线 | ✅ | 10,000 局 19×19 `.nngames`、KataGo 全量重放 |
 | M3 Token 与特征 | ✅ | GoTokenizer、`.nnvocab`、9 平面特征与可视化 |
-| M4 验证器竖切 | 未开始 | 规则 → 特征 → C 模型训练 → 存取 → 评估 |
+| M4 验证器竖切 | ✅ | 规则 → 特征 → C 模型训练 → 存取 → 评估 |
 
 路线图与设计决策见 [`docs/design/00-roadmap.md`](docs/design/00-roadmap.md)，
 全部文档入口见 [`docs/README.md`](docs/README.md)，第三方版本唯一真源见
@@ -62,6 +62,23 @@ git submodule update --init --recursive
 CWI 数据集的当前验收结果是 10,000 局、2,076,112 手、2,086,112 个局面，
 全部经 KataGo 重放，`.nngames` 容器逐字节可逆。格式和边界见
 [`数据与特征格式`](docs/design/08-data-and-features.md)。
+
+## M4 C 验证器
+
+```bash
+.venv/bin/go-pipeline training-cache \
+  --max-games 1000 --eval-games 100 --seed 20261024
+
+./build/cpu/go_train_cli train \
+  --dataset data/m4-c-train.ngf \
+  --eval-dataset data/m4-c-eval.ngf \
+  --epochs 4 --batch-size 64 --lr 0.001 --cpu
+```
+
+正式验收在 CMP 40HX 上完成，使用 `--gpu=40HX`。C 验证器只验证数据、训练、
+checkpoint 和评估链路，不参与 B/C 模型优劣结论。训练缓存格式见
+[`M4 训练缓存`](docs/design/09-training-cache.md)，验收结果见
+[`M4 报告`](docs/benchmarks/m4-c-validator.md)。
 
 ## 棋规
 

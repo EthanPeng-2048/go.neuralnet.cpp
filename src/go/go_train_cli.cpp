@@ -10,6 +10,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -60,6 +61,28 @@ struct EvalMetrics {
     std::size_t samples = 0;
     double seconds = 0;
 };
+
+struct LoadedBatch {
+    std::vector<Scalar> planes;
+    std::vector<std::size_t> labels;
+};
+
+nn::Tensor forward_evaluated(nn::Model& model, const nn::Tensor& input) {
+    nn::ComputeEngine& engine = model.engine();
+    auto begin = engine.begin_batch();
+    if (!begin) {
+        throw std::runtime_error("cannot begin evaluation batch: " + begin.error().message);
+    }
+    auto output = model.forward(input);
+    auto end = engine.end_batch();
+    if (!output) {
+        throw std::runtime_error("evaluation forward failed: " + output.error().message);
+    }
+    if (!end) {
+        throw std::runtime_error("cannot end evaluation batch: " + end.error().message);
+    }
+    return std::move(*output);
+}
 
 std::string option_value(int& index, int argc, char** argv) {
     if (++index >= argc) {
@@ -177,6 +200,9 @@ nn::CnnConfig c_validator_config() {
     nn::CnnConfig config;
     config.in_channels = go::feature_plane_count;
     config.in_size = go::training_board_size;
+    // Keep the validator deliberately small: two 19x19 3x3 convolutions,
+    // 2x2 pooling after each, and the stock FC head. Normalization remains off
+    // because this model is an integration probe, not an architecture search.
     config.pool = 2;
     config.convs = {
         {.out_channels = 32, .kernel = 3, .stride = 1, .padding = 1},
@@ -184,7 +210,7 @@ nn::CnnConfig c_validator_config() {
     };
     config.fc_dims = {256, go::policy_class_count};
     config.norm_type = nn::NormType::BatchNorm;
-    config.norm_place = nn::NormPlace::Conv;
+    config.norm_place = nn::NormPlace::None;
     return config;
 }
 
@@ -211,18 +237,23 @@ std::vector<std::size_t> sample_indices(
     return indices;
 }
 
-std::vector<Scalar> load_batch_planes(
+LoadedBatch load_batch_planes(
     go::FeatureCache& cache,
     const std::vector<std::size_t>& indices,
     std::size_t first,
     std::size_t count
 ) {
-    std::vector<Scalar> result(cache.feature_count() * count, Scalar{0});
+    LoadedBatch result{
+        std::vector<Scalar>(cache.feature_count() * count, Scalar{0}),
+        std::vector<std::size_t>(count),
+    };
     std::vector<float> sample(cache.feature_count());
     for (std::size_t column = 0; column < count; ++column) {
-        cache.read_planes(indices[first + column], sample);
+        go::FeatureSampleMeta metadata;
+        cache.read_sample(indices[first + column], sample, &metadata);
+        result.labels[column] = metadata.target;
         for (std::size_t feature = 0; feature < sample.size(); ++feature) {
-            result[feature * count + column] = sample[feature];
+            result.planes[feature * count + column] = sample[feature];
         }
     }
     return result;
@@ -248,17 +279,14 @@ EvalMetrics evaluate(
     std::vector<Scalar> logits;
     for (std::size_t first = 0; first < indices.size(); first += batch_size) {
         const std::size_t count = std::min(batch_size, indices.size() - first);
-        std::vector<Scalar> host = load_batch_planes(cache, indices, first, count);
+        LoadedBatch batch = load_batch_planes(cache, indices, first, count);
         nn::Tensor input = engine.create_tensor(cache.feature_count(), count);
         if (!input.valid()) {
             throw std::runtime_error("cannot allocate evaluation input tensor");
         }
-        NN_UNWRAP(engine.write(input, std::span<const Scalar>(host)));
-        nn::Tensor output = NN_UNWRAP(model.forward(input));
-        std::vector<std::size_t> labels(count);
-        for (std::size_t column = 0; column < count; ++column) {
-            labels[column] = cache.meta(indices[first + column]).target;
-        }
+        NN_UNWRAP(engine.write(input, std::span<const Scalar>(batch.planes)));
+        nn::Tensor output = forward_evaluated(model, input);
+        const std::vector<std::size_t>& labels = batch.labels;
         const Scalar loss = NN_UNWRAP(
             loss_fn.forward_sparse(engine, output, labels, {}, go::policy_class_count)
         );
@@ -313,17 +341,17 @@ double max_logit_difference(
     }
     const std::size_t count = std::min(batch_size, cache.size());
     std::vector<std::size_t> indices = sample_indices(cache, count);
-    std::vector<Scalar> host = load_batch_planes(cache, indices, 0, count);
+    LoadedBatch batch = load_batch_planes(cache, indices, 0, count);
     nn::ComputeEngine& engine = left.engine();
     nn::Tensor input = engine.create_tensor(cache.feature_count(), count);
     if (!input.valid()) {
         throw std::runtime_error("cannot allocate round-trip input tensor");
     }
-    NN_UNWRAP(engine.write(input, std::span<const Scalar>(host)));
+    NN_UNWRAP(engine.write(input, std::span<const Scalar>(batch.planes)));
     left.set_training(false);
     right.set_training(false);
-    nn::Tensor left_out = NN_UNWRAP(left.forward(input));
-    nn::Tensor right_out = NN_UNWRAP(right.forward(input));
+    nn::Tensor left_out = forward_evaluated(left, input);
+    nn::Tensor right_out = forward_evaluated(right, input);
     std::vector<Scalar> left_values(left_out.size());
     std::vector<Scalar> right_values(right_out.size());
     NN_UNWRAP(engine.read(left_out, std::span<Scalar>(left_values)));
@@ -347,6 +375,24 @@ void write_json(const std::filesystem::path& path, const json& value) {
         throw std::runtime_error("cannot open metrics output: " + path.string());
     }
     output << value.dump(2) << '\n';
+}
+
+void load_weights(const std::string& path, nn::Model& model) {
+    std::cerr << "verifying model file: " << path << '\n';
+    auto verified = nn::verify_model_integrity(path);
+    if (!verified) {
+        throw std::runtime_error(
+            "model integrity check failed for '" + path + "': " +
+            verified.error().message
+        );
+    }
+    std::cerr << "model file verified\n";
+    auto result = nn::load_model(path, model);
+    if (!result) {
+        throw std::runtime_error(
+            "cannot load model '" + path + "': " + result.error().message
+        );
+    }
 }
 
 int inspect_cache(const std::string& path) {
@@ -383,7 +429,7 @@ int train(const TrainOptions& options) {
     model.set_training(true);
 
     const EvalMetrics initial_eval = evaluate(
-        model, eval_cache, options.common.batch_size, options.common.max_samples
+        model, eval_cache, options.common.batch_size, 0
     );
     model.set_training(true);
 
@@ -413,6 +459,9 @@ int train(const TrainOptions& options) {
 
     const auto training_started = std::chrono::steady_clock::now();
     json history = json::array();
+    EvalMetrics final_eval = initial_eval;
+    Scalar first_train_loss = 0;
+    Scalar final_train_loss = 0;
     for (int epoch = 0; epoch < options.epochs; ++epoch) {
         const Scalar epoch_lr = nn::compute_epoch_lr(lr_config, epoch);
         session.set_lr(epoch_lr);
@@ -425,18 +474,15 @@ int train(const TrainOptions& options) {
              first += options.common.batch_size) {
             const std::size_t count =
                 std::min(options.common.batch_size, indices.size() - first);
-            std::vector<Scalar> host = load_batch_planes(
+            LoadedBatch batch = load_batch_planes(
                 train_cache, indices, first, count
             );
             nn::Tensor input = engine.create_tensor(train_cache.feature_count(), count);
             if (!input.valid()) {
                 throw std::runtime_error("cannot allocate training input tensor");
             }
-            NN_UNWRAP(engine.write(input, std::span<const Scalar>(host)));
-            std::vector<std::size_t> labels(count);
-            for (std::size_t column = 0; column < count; ++column) {
-                labels[column] = train_cache.meta(indices[first + column]).target;
-            }
+            NN_UNWRAP(engine.write(input, std::span<const Scalar>(batch.planes)));
+            const std::vector<std::size_t>& labels = batch.labels;
 
             Scalar batch_loss = 0;
             nn::TrainingStepOptions step_options;
@@ -473,9 +519,14 @@ int train(const TrainOptions& options) {
         }
 
         const Scalar mean_loss = loss_sum / static_cast<Scalar>(seen);
+        if (epoch == 0) {
+            first_train_loss = mean_loss;
+        }
+        final_train_loss = mean_loss;
         const EvalMetrics eval = evaluate(
             session.model(), eval_cache, options.common.batch_size, 0
         );
+        final_eval = eval;
         session.model().set_training(true);
         const double epoch_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - epoch_started
@@ -514,7 +565,7 @@ int train(const TrainOptions& options) {
         NN_UNWRAP(nn::peek_any_model_spec(options.checkpoint));
     nn::Model checkpoint_model =
         NN_UNWRAP(nn::build_cnn_model_from_spec(engine, loaded_checkpoint_spec));
-    (void)NN_UNWRAP(nn::load_model(options.checkpoint, checkpoint_model));
+    load_weights(options.checkpoint, checkpoint_model);
     const double checkpoint_diff = max_logit_difference(
         session.model(), checkpoint_model, eval_cache, options.common.batch_size
     );
@@ -523,18 +574,26 @@ int train(const TrainOptions& options) {
         NN_UNWRAP(nn::peek_any_model_spec(options.model));
     nn::Model inference_model =
         NN_UNWRAP(nn::build_cnn_model_from_spec(engine, loaded_model_spec));
-    (void)NN_UNWRAP(nn::load_model(options.model, inference_model));
+    load_weights(options.model, inference_model);
     const double model_diff = max_logit_difference(
         session.model(), inference_model, eval_cache, options.common.batch_size
     );
 
     const bool roundtrip_pass = checkpoint_diff <= 1.0e-5 && model_diff <= 1.0e-5;
+    const bool loss_declined =
+        std::isfinite(static_cast<double>(first_train_loss)) &&
+        std::isfinite(static_cast<double>(final_train_loss)) &&
+        std::isfinite(static_cast<double>(initial_eval.loss)) &&
+        std::isfinite(static_cast<double>(final_eval.loss)) &&
+        final_train_loss < first_train_loss &&
+        final_eval.loss < initial_eval.loss;
+    const bool pass = roundtrip_pass && loss_declined;
     const double total_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - training_started
     ).count();
     json report{
         {"schema", 1},
-        {"status", roundtrip_pass ? "pass" : "fail"},
+        {"status", pass ? "pass" : "fail"},
         {"model", "c-validator-v1"},
         {"dataset", train_cache.path().string()},
         {"eval_dataset", eval_cache.path().string()},
@@ -558,13 +617,18 @@ int train(const TrainOptions& options) {
             {"path", options.model},
             {"max_logit_diff", model_diff},
         }},
+        {"health", {
+            {"loss_declined", loss_declined},
+            {"checkpoint_roundtrip", roundtrip_pass},
+        }},
         {"seconds", total_seconds},
-        {"ram_mib", 0},
     };
     write_json(options.metrics_out, report);
     std::cout << report.dump(2) << '\n';
-    if (!roundtrip_pass) {
-        throw std::runtime_error("checkpoint round-trip logits differ beyond tolerance");
+    if (!pass) {
+        throw std::runtime_error(
+            "M4 acceptance failed: checkpoint round-trip or loss-decline gate"
+        );
     }
     return 0;
 }
@@ -574,9 +638,13 @@ int evaluate_cli(const EvalOptions& options) {
     std::shared_ptr<nn::ComputeEngine> engine_ptr = create_engine(options.common);
     nn::ComputeEngine& engine = *engine_ptr;
     const nn::ModelSpec spec = NN_UNWRAP(nn::peek_any_model_spec(options.model));
+    std::cerr << "loaded model spec: " << nn::spec_summary(spec) << '\n';
     nn::Model model = NN_UNWRAP(nn::build_cnn_model_from_spec(engine, spec));
+    std::cerr << "built model from spec\n";
     const nn::ModelRole role = NN_UNWRAP(nn::peek_model_role(options.model));
-    (void)NN_UNWRAP(nn::load_model(options.model, model));
+    std::cerr << "model role: " << nn::model_role_name(role) << '\n';
+    load_weights(options.model, model);
+    std::cerr << "loaded model weights\n";
     const EvalMetrics metrics =
         evaluate(model, cache, options.common.batch_size, options.common.max_samples);
     std::cout << json{

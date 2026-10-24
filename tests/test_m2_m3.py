@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -28,9 +29,27 @@ from go_pipeline.training import write_feature_cache
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_CLI = ROOT / "build/cpu/go_data_cli"
-RULES_CLI = ROOT / "build/cpu/go_rules_cli"
-TRAIN_CLI = ROOT / "build/cpu/go_train_cli"
+
+
+def binary(name: str) -> Path:
+    directories = []
+    if value := os.environ.get("GO_TEST_BINARY_DIR"):
+        directories.append(Path(value))
+    directories.extend((ROOT / "build/cpu", ROOT / "build/gpu"))
+    for directory in directories:
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+        executable = candidate.with_suffix(".exe")
+        if executable.is_file():
+            return executable
+    searched = ", ".join(str(path) for path in directories)
+    raise RuntimeError(f"cannot find {name}; searched: {searched}")
+
+
+DATA_CLI = binary("go_data_cli")
+RULES_CLI = binary("go_rules_cli")
+TRAIN_CLI = binary("go_train_cli")
 
 
 class M2DataTests(unittest.TestCase):
@@ -123,6 +142,24 @@ class M2DataTests(unittest.TestCase):
             )
             self.assertEqual(exported["id"], record.id)
             self.assertEqual(exported["moves"], list(record.moves))
+            exported_range = json.loads(
+                subprocess.run(
+                    [
+                        str(DATA_CLI),
+                        "export-range",
+                        "--input",
+                        str(dataset),
+                        "--start",
+                        "0",
+                        "--limit",
+                        "1",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+            )
+            self.assertEqual(exported_range["id"], record.id)
 
 
 class M3FeatureTests(unittest.TestCase):

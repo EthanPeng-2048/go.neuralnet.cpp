@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .features import extract_features, sample_from_trace, trace_record
+from .features import sample_from_trace, trace_records
 from .model import GameRecord, PASS_POINT, decode_move
 
 CACHE_MAGIC = b"NGFEAT01"
@@ -53,21 +53,41 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _export_record(data_cli: Path, dataset: Path, index: int) -> GameRecord:
-    result = subprocess.run(
+def _export_records(
+    data_cli: Path,
+    dataset: Path,
+    available: int,
+    indices: list[int],
+) -> list[tuple[int, GameRecord]]:
+    wanted = set(indices)
+    records: dict[int, GameRecord] = {}
+    process = subprocess.Popen(
         [
             str(data_cli),
-            "export",
+            "export-range",
             "--input",
             str(dataset),
-            "--index",
-            str(index),
+            "--start",
+            "0",
+            "--limit",
+            str(available),
         ],
-        check=True,
-        capture_output=True,
-        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
-    return GameRecord.from_json(json.loads(result.stdout))
+    assert process.stdout is not None
+    assert process.stderr is not None
+    for row, line in enumerate(process.stdout):
+        if row in wanted:
+            records[row] = GameRecord.from_json(json.loads(line))
+    stderr = process.stderr.read().decode("utf-8", errors="replace")
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError(f"export-range failed: {stderr.strip()}")
+    missing = wanted.difference(records)
+    if missing:
+        raise RuntimeError(f"export-range omitted indices: {sorted(missing)[:8]}")
+    return [(index, records[index]) for index in indices]
 
 
 def _dataset_game_count(data_cli: Path, dataset: Path) -> int:
@@ -88,14 +108,13 @@ def _value_for_result(outcome: str, to_move: str) -> int:
 
 def _samples_for_game(
     record: GameRecord,
-    rules_cli: Path,
+    trace: dict[str, object],
     *,
     first_sample_id: int,
     game_index: int,
 ) -> list[tuple[int, int, int, int, int, np.ndarray]]:
     if record.board_size != BOARD_SIZE:
         raise ValueError(f"{record.id}: M4 cache requires 19x19 games")
-    trace = trace_record(record, rules_cli)
     frames = trace["frames"]
     assert isinstance(frames, list)
     if len(frames) != len(record.moves) + 1:
@@ -156,34 +175,37 @@ def write_feature_cache(
     with temporary.open("wb") as stream:
         stream.write(header)
         sample_id = 0
-        for game_index, record in records:
-            for (
-                current_id,
-                current_game,
-                move_number,
-                target,
-                value,
-                planes,
-            ) in _samples_for_game(
-                record,
-                rules_cli,
-                first_sample_id=sample_id,
-                game_index=game_index,
-            ):
-                if planes.shape != (FEATURE_COUNT,):
-                    raise ValueError(f"{record.id}: invalid cached feature shape")
-                stream.write(
-                    CACHE_RECORD.pack(
-                        current_id,
-                        current_game,
-                        move_number,
-                        target,
-                        value,
-                        0,
+        for chunk_start in range(0, len(records), 32):
+            chunk = records[chunk_start : chunk_start + 32]
+            traces = trace_records([record for _, record in chunk], rules_cli)
+            for (game_index, record), trace in zip(chunk, traces, strict=True):
+                for (
+                    current_id,
+                    current_game,
+                    move_number,
+                    target,
+                    value,
+                    planes,
+                ) in _samples_for_game(
+                    record,
+                    trace,
+                    first_sample_id=sample_id,
+                    game_index=game_index,
+                ):
+                    if planes.shape != (FEATURE_COUNT,):
+                        raise ValueError(f"{record.id}: invalid cached feature shape")
+                    stream.write(
+                        CACHE_RECORD.pack(
+                            current_id,
+                            current_game,
+                            move_number,
+                            target,
+                            value,
+                            0,
+                        )
                     )
-                )
-                stream.write(planes.astype("<f4", copy=False).tobytes(order="C"))
-                sample_id += 1
+                    stream.write(planes.astype("<f4", copy=False).tobytes(order="C"))
+                    sample_id += 1
     temporary.replace(output)
     return CacheBuildResult(
         path=output,
@@ -217,16 +239,14 @@ def build_training_caches(
     selected = random.Random(seed).sample(range(available), max_games)
     selected.sort()
     eval_indices = set(selected[-eval_games:])
-    train_records = [
-        (index, _export_record(data_cli, dataset, index))
-        for index in selected
-        if index not in eval_indices
-    ]
-    eval_records = [
-        (index, _export_record(data_cli, dataset, index))
-        for index in selected
-        if index in eval_indices
-    ]
+    train_indices = [index for index in selected if index not in eval_indices]
+    eval_indices_ordered = [index for index in selected if index in eval_indices]
+    train_records = _export_records(
+        data_cli, dataset, available, train_indices
+    )
+    eval_records = _export_records(
+        data_cli, dataset, available, eval_indices_ordered
+    )
     train = write_feature_cache(
         train_output,
         split="train",
