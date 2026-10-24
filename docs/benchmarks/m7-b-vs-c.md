@@ -114,8 +114,13 @@ so the Conv stem and the layout ops dominate, not the transformer width):
 | C validator (reference) | 3 | 4.62% | 12.60% | — |
 
 `--value-weight` (new) and `step_cosine` (cosine warm restarts, expressed as a
-per-epoch lr table on top of the library's scheduIer) came out of this sweep.
+per-epoch lr table on top of the library's scheduler) came out of this sweep.
 d=96 is too narrow; d=128 is the smallest width that matches C.
+
+`step_cosine` over 16 epochs on the best config (d=128, lr 1e-3, vw=1) is
+**worse for the policy** — best 4.07% (epoch 7) — but its restarts keep the
+value head much healthier: eval AUC reaches 0.68 (vs 0.518 with plain cosine),
+i.e. the schedule trades policy accuracy for value ranking. Neither beats C.
 
 ### Head-to-head
 
