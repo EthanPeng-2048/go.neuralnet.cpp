@@ -83,6 +83,30 @@ same cache and seed.
 | Value AUC (B only) | — | 0.37 (train 0.9995) |
 | Seconds / epoch | 5.4 | 216 |
 
+### M9-scale probe: 910 train games / 189,537 samples (40HX)
+
+100 eval games / 20,369 samples, batch 32, 6 epochs, same seed.
+
+| Metric | C validator | B-128 (d=128/6 layers) |
+|---|---:|---:|
+| Eval top-1 (best epoch) | **10.00%** (ep5) | 5.74% (ep1) / 5.80% (ep2) / 5.69% (ep3) |
+| Eval top-3 (best) | 22.15% | 15.23% |
+| Eval loss (best) | 4.428 | 6.206 (CE + value MSE) |
+| Train top-1, 20k samples | 18.36% | 6.25% |
+| Seconds / epoch | 122 | 1107 |
+
+Two things stand out:
+
+1. **C scales with data** (4.62% @ 110 games → 10.00% @ 910) and overfits in the
+   usual way (train 18.4% vs eval 10.0%).
+2. **B does not**: its train top-1 (6.25%) is barely above its eval top-1
+   (5.69%), i.e. it is *underfitting*, and its eval curve is flat from epoch 1
+   to 3. The bottleneck is representational/optimisation, not data.
+
+Ablation: `--value-weight 0` (policy-only) made it worse — epoch 1 2.41%,
+epoch 2 1.36% with the training loss *rising* (5.28 → 5.45). The value head is
+not the problem; it acts as an auxiliary task that stabilises the trunk.
+
 ### B at 20 epochs (same 110-game cache, 40HX)
 
 Training longer does not close the gap — it memorises:
