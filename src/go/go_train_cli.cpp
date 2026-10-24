@@ -256,8 +256,9 @@ TrainOptions parse_train_options(int argc, char** argv) {
     if (options.warmup_epochs < 0 || options.warmup_epochs >= options.epochs) {
         throw std::invalid_argument("warmup-epochs must be in [0, epochs)");
     }
-    if (options.schedule != "cosine" && options.schedule != "constant") {
-        throw std::invalid_argument("schedule must be cosine or constant");
+    if (options.schedule != "cosine" && options.schedule != "constant" &&
+        options.schedule != "step_cosine") {
+        throw std::invalid_argument("schedule must be cosine, constant or step_cosine");
     }
     if (options.metrics_log.empty()) {
         options.metrics_log = options.metrics_out;
@@ -957,6 +958,32 @@ int train(const TrainOptions& options) {
     lr_config.total_epochs = options.epochs;
     lr_config.warmup_epochs = options.warmup_epochs;
     lr_config.schedule = options.schedule;
+    if (options.schedule == "step_cosine") {
+        // 库只提供 constant/cosine，这里用 lr_per_epoch 表达"三段余弦 + 重启"
+        // （SGDR 口径）：每段内余弦从 base_lr 退到 min_lr，段边界重启；
+        // warmup 作用在第一段。段数 = 3（可被 --epochs 截断）。
+        const int segments = 3;
+        const int per_segment = std::max(1, options.epochs / segments);
+        std::vector<Scalar> table(static_cast<std::size_t>(options.epochs));
+        for (int epoch = 0; epoch < options.epochs; ++epoch) {
+            const int local = epoch % per_segment;
+            const Scalar progress =
+                static_cast<Scalar>(local) / static_cast<Scalar>(per_segment);
+            const Scalar cosine =
+                Scalar{0.5} * (Scalar{1} + std::cos(static_cast<Scalar>(3.14159265358979323846) * progress));
+            table[static_cast<std::size_t>(epoch)] =
+                options.min_lr + (options.lr - options.min_lr) * cosine;
+        }
+        if (options.warmup_epochs > 0) {
+            for (int epoch = 0; epoch < options.warmup_epochs && epoch < options.epochs; ++epoch) {
+                table[static_cast<std::size_t>(epoch)] =
+                    options.lr * static_cast<Scalar>(epoch + 1) /
+                    static_cast<Scalar>(options.warmup_epochs);
+            }
+        }
+        lr_config.lr_per_epoch = std::move(table);
+        lr_config.schedule = "constant";  // 表优先；显式写明不留歧义
+    }
 
     const int final_epoch = options.stop_after_epoch > 0
         ? options.stop_after_epoch
@@ -1374,6 +1401,7 @@ void usage(const char* program) {
         << " [--conv-channels 64] [--history-len 64] [--value-weight 1.0]\n"
         << "       [--optimizer adamw] [--schedule cosine] [--lr 0.001]"
         << " [--min-lr 0.00001] [--weight-decay 0.0001]\n"
+        << "       [--schedule cosine|constant|step_cosine]"
         << "       [--beta1 0.9] [--beta2 0.999] [--clip-grad-norm 1.0]"
         << " [--warmup-epochs 0]\n"
         << "       [--resume FILE.nnckpt] [--stop-after-epoch N] [--metrics-log FILE.jsonl]\n"
