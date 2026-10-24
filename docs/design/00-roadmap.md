@@ -261,6 +261,29 @@ visits **数目**是可谈判条款（§2，40–100 已有实质战力——先
   本机未装 gnugo，测试自动跳过（同 M1 语义）。
 - 完整数据和命令见 [`M6 验收`](../benchmarks/m6-gtp-arena.md)。
 
+### 6.8 M7 执行记录（2026-10-24）
+
+- ✅ **B 架构落地为单个复合层**（`go::GoModel`，GPTModel 同款写法）：
+  Conv stem（9→64→d，5×5 区域 token）+ 历史 embedding + decision query →
+  90 token 单序列 → `TransformerEncoderLayer` ×N（Pre-Norm，Plain 双向）→
+  LayerNorm → 策略(362)/价值(tanh) 双头 → 打包 `(363, batch)`。
+- ✅ **逐元素数学全部走 `dsl::compute`**（位置+段嵌入的融合加法、tanh、
+  tanh 雅可比 `1-t²`）；GPU 侧用 neuralnet.cpp 的标准机制接入 AOT 融合：
+  每个可执行目标把模型 TU 编进自己的收集器 + `nn_enable_gpu_fusion`，
+  850M 上实测无闭合世界 miss，存盘往返 diff 0.0（CPU/GPU 均为 0）。
+- ✅ **GoLoss**：行 [0,362) 稀疏 CE + 行 362 MSE，梯度拼回单张量。
+- ✅ **D6 零补丁 spec**：`Transformer + patch_size=5 + layer_dims[0]=0x476F4D31`，
+  训练器/评估器/策略端都能从 spec 精确重建（续训、evaluate、GTP、Arena）。
+- ✅ 契约测试：`go_model_tests`（常量 / spec 往返 / tiny 前反向 / GoLoss）、
+  `test_m7_b_model`（双头指标 + 非退化价值目标 + B 续训等价 + GTP 落子合法）。
+- ⚠ **验收项「同数据下 B 显著优于 C」尚未达成**：30 局（6353 样本）上 B
+  过拟合——训练集 top-1 13.4%（C 4.2%）、评估集 1.27%（C 1.74%）。
+  数据规模不足是唯一可见原因（容量 4M vs 0.5M），需要 M9 的万局量级；
+  40HX 上的对照运行是本项的正式载体，数据见
+  [`M7 验收`](../benchmarks/m7-b-vs-c.md)。
+- 过程中修掉三个会静默错数的 bug：价值目标符号（`black` vs `b` 恒等 -1）、
+  价值 AUC 的并列名次公式、续训时 K 取自 `--history-len` 而非断点 spec。
+
 ## 7. 算力预算（推导口径，M0 用实测替换）
 
 基准事实（上游实测，40HX）：FP32 理论 9.14 TFLOPS，GEMM 达 45%（4125 GFLOPS @4096³），

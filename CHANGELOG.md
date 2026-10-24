@@ -4,6 +4,50 @@ All notable project changes are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning once public model or data formats are declared stable.
 
+## [0.3.0] - 2026-10-24
+
+### Added
+
+- M7 `go::GoModel`: the B architecture as a single `nn::Layer`, written the way
+  neuralnet.cpp writes its own models (GPTModel composition pattern): Conv stem
+  (9→64→d, 5×5 region tokens) + per-move history embedding + learnable
+  decision query → `25+K+1`-token sequence → `TransformerEncoderLayer` ×N
+  (Pre-Norm, Plain bidirectional) → LayerNorm → policy (362) / value (tanh)
+  heads, packed into one `(363, batch)` output. Position + segment embeddings,
+  tanh and the tanh Jacobian are `dsl::compute` expressions.
+- M7 `go::GoLoss`: sparse CE over rows 0..361 + MSE over row 362, with both
+  gradients re-packed into a single `(363, batch)` tensor.
+- GPU AOT fusion via neuralnet.cpp's standard mechanism: each executable
+  compiles the model TU into its own collector and calls
+  `nn_enable_gpu_fusion(<target> MAIN <main source>)`; the fused structures are
+  registered by `FusedAnchor` at static-init time. Verified on the GTX 850M:
+  no closed-world miss, checkpoint round-trip diff 0.0.
+- ModelSpec (D6 zero patch): `type=Transformer` + `patch_size=5` +
+  `layer_dims[0]=0x476F4D31`; trainer, evaluator and policy player rebuild the
+  exact model from the spec (resume / `evaluate` / GTP / arena).
+- Tests: `go_model_tests` (contract constants, spec round-trip, tiny CPU
+  forward/backward, GoLoss), `test_m7_b_model` (dual-head metrics with a
+  non-degenerate value target set, B resume equivalence, GTP genmove legality).
+
+### Fixed
+
+- Value targets were wrong for every sample: the cache writer compared the game
+  outcome ("black"/"white") with the M2 colour tag ("b"/"w"), so `z` was always
+  -1 and the value head trained on a constant. Now mapped through the
+  side-to-move; caches must be regenerated.
+- Value AUC rank statistic used `(rank+len)/2` for tie groups instead of
+  `rank+(len-1)/2`, which biased the metric (it could even go negative).
+- `--resume` of a B checkpoint derived K from `--history-len` before reading
+  the checkpoint spec; it now takes K from the checkpoint and gates the caches
+  against that.
+
+### Known limitations
+
+- The M7 DoD "same data, B significantly better than C" is **not yet
+  demonstrated**: on the 30-game cache B overfits (train top-1 13.4% vs eval
+  1.27%, C 4.2% / 1.74%). B needs the M9 dataset scale; see
+  `docs/benchmarks/m7-b-vs-c.md` for the numbers and the open item.
+
 ## [0.2.0] - 2026-10-24
 
 ### Added

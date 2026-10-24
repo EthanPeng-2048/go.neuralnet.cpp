@@ -57,16 +57,30 @@ B's own value-head metrics.
 
 ## Measured results
 
-Both runs below are the same recipe on the same cache, differing only in
-`--arch`; the numbers come from the run JSONs.
+Both runs below are the same recipe on the same cache (30 train games / 6353
+samples, 10 eval games / 2129 samples), differing only in `--arch`; numbers
+come from the run JSONs.
 
 | Metric | C validator | B encoder | Notes |
 |---|---:|---:|---|
-| Eval policy top-1 (final) | 1.74% | | higher is better |
-| Eval policy top-3 (final) | 3.24% | | |
-| Eval loss (final) | 5.754 | | not comparable across architectures |
-| Value AUC (B only) | — | | 0.5 = chance |
-| Checkpoint round-trip diff | 0.0 | | must be 0 (bit-exact reload) |
+| Eval policy top-1 (final) | 1.74% | 1.27% | higher is better |
+| Eval policy top-3 (final) | 2.91% | 3.19% | |
+| Eval loss (final) | 5.735 | 8.10 | B's loss includes the value MSE — not comparable |
+| Value AUC (B only) | — | 0.37 | 0.5 = chance |
+| Checkpoint round-trip diff | 0.0 | 0.0 | bit-exact reload (CPU and GPU) |
+| Seconds / epoch | 5.4 | 216 | 850M, batch 16 |
+
+**At this data scale B is not yet better than C on eval top-1, and the reason is
+visible in the train-set numbers:** evaluated on the *training* cache, C reaches
+4.2% top-1 / 8.1% top-3 while B reaches 13.4% / 24.6% (value AUC 0.999). B has
+the capacity and learns the task, but 30 games (6.4k samples) cannot support
+~4M parameters: it memorizes. The M7 DoD ("同数据下 B 显著优于 C") therefore
+needs the dataset scale that M9 uses (10k+ games); the 40HX run reported in
+this file is the acceptance vehicle, not the 850M smoke.
+
+Also note the value head *hurts* at this scale: its eval AUC (0.37) is below
+chance while its train AUC is 0.999, i.e. it memorizes outcomes, and its
+gradient shares the trunk with the policy head.
 
 ## Input-contract verification
 
