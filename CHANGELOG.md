@@ -43,10 +43,13 @@ semantic versioning once public model or data formats are declared stable.
 
 ### Known limitations
 
-- The M7 DoD "same data, B significantly better than C" is **not yet
-  demonstrated**: on the 30-game cache B overfits (train top-1 13.4% vs eval
-  1.27%, C 4.2% / 1.74%). B needs the M9 dataset scale; see
-  `docs/benchmarks/m7-b-vs-c.md` for the numbers and the open item.
+- The M7 DoD "same data, B significantly better than C" is **not achieved**.
+  Measured on three data scales (30 / 110 / 910 games): C 1.74% / 4.62% /
+  **10.00%** eval top-1, B 1.27% / 4.57% / 5.80%. At 30 games B overfits, at
+  910 it underfits; the design's §3.1 fallback (CNN-direct policy logits,
+  `--cnn-policy 1`) lifts B to 8.23% but C still wins the head-to-head arena
+  20-0. Remaining levers are M9-scale data and a wider model, not tuning.
+  Full evidence: `docs/benchmarks/m7-b-vs-c.md`, roadmap §6.8.
 
 ## [0.2.0] - 2026-10-24
 
