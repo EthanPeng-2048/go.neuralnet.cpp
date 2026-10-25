@@ -258,14 +258,18 @@ private:
     void spawn() {
 #if defined(_WIN32)
         SECURITY_ATTRIBUTES inherit{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+        // 父→子管道：写端 to_child_write 归父进程，读端 to_child_read 给子进程 stdin。
+        // 子→父管道：写端 from_child_write 给子进程 stdout，读端 from_child_read 归父进程。
+        // （两条管道的两端必须各自成对；接错会让 stdin/stdout 短路到同一根管道，
+        //  父进程的读端立即 EOF、子进程又永远收不到 EOF 而泄漏。）
         HANDLE to_child_read = nullptr;
-        HANDLE from_child_write = nullptr;
-        if (!CreatePipe(&to_child_read, &from_child_write, &inherit, 0)) {
+        HANDLE to_child_write = nullptr;
+        if (!CreatePipe(&to_child_read, &to_child_write, &inherit, 0)) {
             throw std::runtime_error("cannot create gtp pipes");
         }
-        HANDLE to_child_write = nullptr;
         HANDLE from_child_read = nullptr;
-        if (!CreatePipe(&to_child_write, &from_child_read, &inherit, 0)) {
+        HANDLE from_child_write = nullptr;
+        if (!CreatePipe(&from_child_read, &from_child_write, &inherit, 0)) {
             throw std::runtime_error("cannot create gtp pipes");
         }
         SetHandleInformation(to_child_write, HANDLE_FLAG_INHERIT, 0);
@@ -400,7 +404,12 @@ private:
     void reap() {
 #if defined(_WIN32)
         if (process_ != nullptr) {
-            WaitForSingleObject(process_, 5000);
+            // 与 Linux 分支同语义：5 秒内不退就强杀，绝不留孤儿（孤儿会继承
+            // 宿主的 stderr 句柄，让上层读管道永远等不到 EOF）。
+            if (WaitForSingleObject(process_, 5000) == WAIT_TIMEOUT) {
+                TerminateProcess(process_, 1);
+                WaitForSingleObject(process_, 5000);
+            }
             CloseHandle(process_);
             process_ = nullptr;
         }
