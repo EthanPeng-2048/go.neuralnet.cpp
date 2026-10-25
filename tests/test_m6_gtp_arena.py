@@ -365,17 +365,20 @@ class GnuGoArenaTests(unittest.TestCase):
         cls._temporary.cleanup()
 
     def test_model_vs_gnugo(self) -> None:
+        # 这里验的是"外部 GTP 子进程对手"这条链路，不是 GnuGo 的棋力；
+        # --level 1 只影响 GnuGo 的阅读深度，能把两盘 19×19 从 ~9 分钟压到
+        # ~2 分钟（全默认 level 10 会让整文件超出 ctest 预算）。
         result = subprocess.run(
             [
                 str(ARENA_CLI),
                 "--player", f"model:{self.model}=cpu",
-                "--opponent", "gtp:gnugo --mode gtp --quiet",
+                "--opponent", "gtp:gnugo --mode gtp --quiet --level 1",
                 "--games", "2", "--size", "19", "--seed", "13",
                 "--sprt-p0", "0.45", "--sprt-p1", "0.6",
             ],
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=800,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)

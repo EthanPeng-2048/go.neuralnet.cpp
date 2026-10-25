@@ -117,6 +117,26 @@ GTP 适配器的规则与特征提取复用 KataGo 与 M3 管线（与训练输�
 Arena 用 KataGo 面积计分定胜负。验收结果见
 [`M6 报告`](docs/benchmarks/m6-gtp-arena.md)。
 
+## 对弈室 GUI（浏览器开，中国规则）
+
+```bash
+# 默认对手 = GnuGo（装了 gnugo 时；否则自动找模型，再退回 random）
+# 竞技台默认 = 项目模型（黑） vs GnuGo（白）
+./build/cpu/go_gui_cli
+# 浏览器打开打印的 http://127.0.0.1:8765
+
+# 指定模型 / GPU，并把竞技台对手也换成它
+./build/cpu/go_gui_cli --model run.nnmodel --device 40HX \
+  --black-engine model:run.nnmodel=40HX \
+  --white-engine "gtp:gnugo --mode gtp --quiet" --speed 800
+```
+
+两个模式：**对弈**（人类 vs 引擎：点按落子、悔棋、停一手、认输、SGF 导出）
+与**竞技台**（引擎自动对局观战：节奏可控、换先开新局、累计比分、
+候选着热力图、价值头形势判断）。规则固定**中国规则**（位置超级劫 +
+数子计分 + 贴 7.5 目），棋规全走 KataGo、选点全走 `PolicyPlayer`，与
+GTP/Arena 同源；设计与 HTTP 契约见 [`10-gui.md`](docs/design/10-gui.md)。
+
 ## 棋规
 
 规则唯一真源是 KataGo `v1.18.2` 的 `Board + BoardHistory + Rules`。项目 API

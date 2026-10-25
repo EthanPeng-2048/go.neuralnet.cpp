@@ -1,6 +1,6 @@
 # go.neuralnet.cpp 设计与路线图
 
-> 状态：**v0.11**（2026-10-24）· v0.4：范围裁定不做 RL（D9）+ 方案 1/2 文档；
+> 状态：**v0.12**（2026-10-25）· v0.4：范围裁定不做 RL（D9）+ 方案 1/2 文档；
 > v0.5：**方案 3（搜索控制 Token 蒸馏）落档**——算法/实践分离
 > （[05 算法](05-scheme3-algorithm.md) / [06 实践](06-scheme3-engineering.md)）、
 > D3 V100 实测修订、**D10 立项**；
@@ -9,7 +9,8 @@
 > v0.8：**M0 按公开 4060/KataGo 基准近似闭合**，进入 M1；
 > v0.9：**M1 KataGo 棋规适配完成**：题库、SGF 回放、GnuGo 对拍与性能闸门通过；
 > v0.10：**M2/M3 完成**：1 万局 `.nngames`、GoTokenizer、9 平面特征与可视化验收；
-> v0.11：**M4 完成**：C 验证器在 CMP 40HX 上完成 4 epoch、可复现评估与零差异存取
+> v0.11：**M4 完成**：C 验证器在 CMP 40HX 上完成 4 epoch、可复现评估与零差异存取；
+v0.12：**对弈室 GUI 落地**（对弈 + 竞技台，中国规则）
 > 上游库：[`neuralnet.cpp` `v1.12.0`](https://github.com/EthanPeng-2048/neuralnet.cpp/tree/v1.12.0)
 > （C++26 header-only，CPU/Vulkan 双后端，无 CUDA；完整锁定信息见
 > [DEPENDENCIES.md](../../DEPENDENCIES.md)）
@@ -161,6 +162,7 @@ visits **数目**是可谈判条款（§2，40–100 已有实质战力——先
 | **M5** ✅ | `GoTrainer` 正式版：`--resume`、指标落盘、双角色存取 | 断点续训无损；监督配方可 CLI 表达 | M4 |
 | **M6** ✅ | GTP 适配器 + Arena（SPRT） | Sabaki 亲手可下；vs GnuGo 自动评估 | M1,M5 |
 | **M7** | **B 架构**替换 C（复合层 + 双头 + GoLoss + 合法性掩码） | ⚠️ 架构/存盘/速度 达成；**"显著优于 C" 未达成**（见 §6.8） | M5 |
+| **GUI** ✅ | **对弈室 GUI**（对弈 + 竞技台，中国规则） | 浏览器亲手可下；引擎自动对局可观赏（候选着热力图 / 价值头 / 比分 / SGF） | M6,M7 |
 | **M8** | **MCTS 推理引擎**（PUCT / 先验归一化 / 合法性 / 转置表；**只搜索不训练**——自对局训练循环随 D9 移出） | 9×9 沙盒（D2 允许）：vs 方案 1 纯先验显著增益；vs GnuGo 胜率达标；19×19 速度 ≥ §7 预算 | M6,M7 |
 | **M9** | 监督 10–30 万局正式训练 + 按赌约条件对 KataGo/对手调参（**无自对局微调**，D9） | 按赌约条件的正式评估达标 | M8 |
 
@@ -297,6 +299,21 @@ visits **数目**是可谈判条款（§2，40–100 已有实质战力——先
   直通头），不是调参。
 - 过程中修掉三个会静默错数的 bug：价值目标符号（`black` vs `b` 恒等 -1）、
   价值 AUC 的并列名次公式、续训时 K 取自 `--history-len` 而非断点 spec。
+
+### 6.9 GUI 执行记录（2026-10-25）
+
+- ✅ `go_gui_cli`：本地 web 对弈室（对弈 + 竞技台），规则固定中国规则
+  （`RuleSet::chinese`：位置超级劫 + 数子计分 + 禁止自杀 + 贴 7.5 目），
+  棋规全走 KataGo、选点全走 `PolicyPlayer`，与 GTP/Arena 同源。
+- ✅ 引擎抽象从 `go_arena_cli` 抽出为 `go/arena_engine`，竞技台与 SPRT
+  评估共用 random / model / 外部 GTP 子进程三种引擎；顺手修掉外部 GTP
+  `genmove` 返回值大小写（GnuGo 3.8 返回大写 `PASS`）导致的解析失败。
+- ✅ `PolicyPlayer::evaluate`：与 `select_move` 同一次前向，输出合法着
+  softmax 分布 + 价值头（GUI 的候选着热力图 / 形势判断；M8 的 MCTS 先验
+  将复用同一接口）。
+- ✅ 测试：`go_gui_session_tests`（6 组状态机单测）+ `go_gui_http`
+  （11 组，起真实 `go_gui_cli` 走 HTTP 全流程，含模型引擎评估）。
+- 设计与 HTTP 契约见 [`10-gui.md`](10-gui.md)。
 
 ## 7. 算力预算（推导口径，M0 用实测替换）
 

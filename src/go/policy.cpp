@@ -133,7 +133,7 @@ const std::string& PolicyPlayer::model_path() const noexcept {
     return impl_->model_path;
 }
 
-std::optional<Point> PolicyPlayer::select_move(const Game& game) {
+void PolicyPlayer::forward_logits(const Game& game) {
     if (game.width() != static_cast<int>(training_board_size) ||
         game.height() != static_cast<int>(training_board_size)) {
         throw std::invalid_argument(
@@ -172,6 +172,12 @@ std::optional<Point> PolicyPlayer::select_move(const Game& game) {
     nn::Tensor output = forward_scoped(state.model, input);
     state.logits.resize(output.size());
     NN_UNWRAP(engine.read(output, std::span<nn::Scalar>(state.logits)));
+}
+
+std::optional<Point> PolicyPlayer::select_move(const Game& game) {
+    forward_logits(game);
+    Impl& state = *impl_;
+    const Stone color = game.to_move();
 
     // 合法性掩码 + argmax（host 侧，roadmap §4）。argmax 只扫策略行
     // [0, policy_class_count)；B 的第 362 行是价值输出，不参与选点。
@@ -204,6 +210,53 @@ std::optional<Point> PolicyPlayer::select_move(const Game& game) {
         return std::nullopt;
     }
     return best_point;
+}
+
+PolicyEvaluation PolicyPlayer::evaluate(const Game& game) {
+    forward_logits(game);
+    Impl& state = *impl_;
+    const Stone color = game.to_move();
+
+    PolicyEvaluation result;
+    result.policy.assign(policy_class_count, 0.0F);
+
+    // 合法着集合上的 softmax：非法着保持 0，这份分布可以直接画落子热力图。
+    std::vector<std::size_t> legal;
+    legal.reserve(40);
+    constexpr std::size_t kPass = feature_plane_stride;  // 361
+    if (game.is_legal(color, std::nullopt)) {
+        legal.push_back(kPass);
+    }
+    for (int y = 0; y < game.height(); ++y) {
+        for (int x = 0; x < game.width(); ++x) {
+            if (game.is_legal(color, Point{x, y})) {
+                legal.push_back(static_cast<std::size_t>(y) * game.width() + x);
+            }
+        }
+    }
+    if (!legal.empty()) {
+        nn::Scalar max_logit = -std::numeric_limits<nn::Scalar>::infinity();
+        for (const std::size_t index : legal) {
+            max_logit = std::max(max_logit, state.logits[index]);
+        }
+        double total = 0.0;
+        for (const std::size_t index : legal) {
+            const double weight =
+                std::exp(static_cast<double>(state.logits[index] - max_logit));
+            total += weight;
+            result.policy[index] = static_cast<float>(weight);
+        }
+        for (const std::size_t index : legal) {
+            result.policy[index] =
+                static_cast<float>(static_cast<double>(result.policy[index]) / total);
+        }
+    }
+
+    // 价值行只存在于 B 编码器（363 行打包输出）；C 验证器 362 行全是策略。
+    if (state.history_len > 0 && state.logits.size() > value_row_index) {
+        result.value = static_cast<float>(state.logits[value_row_index]);
+    }
+    return result;
 }
 
 }  // namespace go

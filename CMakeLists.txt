@@ -149,7 +149,7 @@ endif()
 # M6: the arena plays batches of games between two engines (random / model /
 # external GTP subprocess) and applies an SPRT win-rate test to the player.
 add_executable(go_arena_cli src/go/go_arena_cli.cpp)
-target_link_libraries(go_arena_cli PRIVATE go_policy)
+target_link_libraries(go_arena_cli PRIVATE go_arena_engine go_policy)
 if(WIN32)
     target_link_options(go_arena_cli PRIVATE "LINKER:/STACK:8388608")
 endif()
@@ -160,6 +160,45 @@ if(TARGET compile_gpu_shaders)
     nn_enable_gpu_fusion(go_gtp_cli MAIN src/go/go_gtp_cli.cpp)
     target_sources(go_arena_cli PRIVATE src/go/go_model.cpp)
     nn_enable_gpu_fusion(go_arena_cli MAIN src/go/go_arena_cli.cpp)
+endif()
+
+# GUI: 对局引擎抽象（random / model / 外部 GTP 子进程）抽出共用，
+# go_arena_cli 的批量评估与 GUI 竞技台走同一实现。
+add_library(go_arena_engine STATIC src/go/arena_engine.cpp)
+target_link_libraries(go_arena_engine PUBLIC go_policy)
+
+# GUI: 会话状态机（对弈 + 竞技台）+ 极简 HTTP 服务器 + 内嵌单页前端。
+# 规则固定中国规则（go::RuleSet::chinese），选点走 go::PolicyPlayer。
+find_package(Threads REQUIRED)
+add_library(go_gui STATIC src/go/gui_session.cpp src/go/http_server.cpp)
+target_include_directories(go_gui PUBLIC include)
+target_link_libraries(go_gui PUBLIC go_arena_engine go_policy Threads::Threads)
+
+# gui/index.html 在构建期嵌入 go_gui_cli（raw string literal）。
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/gui_page.hpp"
+    COMMAND ${CMAKE_COMMAND}
+        "-DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/gui/index.html"
+        "-DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generated/gui_page.hpp"
+        "-DVAR=kGuiPage"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake"
+    DEPENDS gui/index.html cmake/embed_text.cmake
+    COMMENT "Embedding gui/index.html into gui_page.hpp"
+    VERBATIM)
+
+add_executable(go_gui_cli
+    src/go/go_gui_cli.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/gui_page.hpp")
+target_include_directories(go_gui_cli PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_link_libraries(go_gui_cli PRIVATE go_gui)
+if(WIN32)
+    target_link_options(go_gui_cli PRIVATE "LINKER:/STACK:8388608")
+endif()
+
+if(TARGET compile_gpu_shaders)
+    target_sources(go_gui_cli PRIVATE src/go/go_model.cpp)
+    nn_enable_gpu_fusion(go_gui_cli MAIN src/go/go_gui_cli.cpp)
 endif()
 
 include(CTest)
@@ -184,6 +223,12 @@ if(BUILD_TESTING)
     target_link_libraries(go_model_tests PRIVATE go_model)
     add_test(NAME go_model_m7_tests COMMAND go_model_tests)
     set_tests_properties(go_model_m7_tests PROPERTIES TIMEOUT 120)
+
+    # GUI: 会话状态机单测（对弈流程、悔棋、竞技台步进与换先、SGF、状态 JSON）。
+    add_executable(go_gui_tests tests/go_gui_tests.cpp)
+    target_link_libraries(go_gui_tests PRIVATE go_gui)
+    add_test(NAME go_gui_session_tests COMMAND go_gui_tests)
+    set_tests_properties(go_gui_session_tests PROPERTIES TIMEOUT 120)
 
     # Keep Python in the verification path without making it a build dependency.
     # Prefer the project's development venv, but allow an explicit interpreter.
@@ -245,7 +290,7 @@ if(BUILD_TESTING)
             COMMAND "${GO_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_m6_gtp_arena.py"
         )
         set_tests_properties(go_gtp_arena_m6 PROPERTIES
-            TIMEOUT 600
+            TIMEOUT 900
             ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_gtp_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
         )
         # v2 cache: the per-sample move history must match the Python
@@ -269,6 +314,16 @@ if(BUILD_TESTING)
         set_tests_properties(go_model_m7_python PROPERTIES
             TIMEOUT 600
             ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_train_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+        # GUI: 起一个真实 go_gui_cli，走 HTTP 全流程（页面、对弈、引擎应手、
+        # 悔棋、竞技台自动对局、SGF、评估接口）。
+        add_test(
+            NAME go_gui_http
+            COMMAND "${GO_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gui_http.py"
+        )
+        set_tests_properties(go_gui_http PROPERTIES
+            TIMEOUT 300
+            ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_gui_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
         )
     endif()
     find_program(GNUGO_EXECUTABLE gnugo)

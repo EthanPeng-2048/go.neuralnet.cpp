@@ -4,6 +4,47 @@ All notable project changes are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning once public model or data formats are declared stable.
 
+## [0.4.0] - 2026-10-25
+
+### Added
+
+- `go_gui_cli`: a local play/arena GUI served to the browser (single-file
+  `gui/index.html` embedded at build time). Play mode drives human vs engine
+  games (click to move, undo, pass, resign, SGF export); arena mode streams
+  engine vs engine matches with pacing, colour alternation, a scoreboard, and
+  auto-started follow-up games. Rules are fixed to Chinese rules
+  (`go::RuleSet::chinese`: positional superko, area/stone scoring, no suicide,
+  7.5 komi) and every legality/score decision stays in KataGo.
+- `go::PolicyPlayer::evaluate`: masked-softmax policy distribution over legal
+  moves plus the value head from the same forward pass that `select_move` uses
+  (backing the GUI's candidate heatmap and position judgement; the M8 MCTS
+  prior will reuse it). Engines without a policy (`random`, external GTP) do
+  not error out: they synthesize a "next move at 100%" preview
+  (`synthetic = true`) — `random` caches the announced move and plays it,
+  external GTP engines are asked with `reg_genmove`.
+- The GUI's default opponent is now GNU Go (`gtp:gnugo --mode gtp --quiet`)
+  whenever `gnugo` is on the PATH, falling back to the auto-discovered model
+  and then `random`; the arena defaults to project model (black) vs that
+  opponent (white). Arena scoreboards track wins per engine: the totals follow
+  the engines across the per-game colour swap.
+- `go::arena_engine`: the arena engine abstraction (`random` /
+  `model:FILE[=DEVICE]` / `gtp:COMMAND`) extracted from `go_arena_cli` so the
+  GUI arena and the SPRT evaluator share one implementation.
+- Tests: `go_gui_tests` (session state machine: play flow, undo, Chinese-rule
+  scoring, resign, arena stepping/colour swap/scoreboard, SGF, state JSON) and
+  `tests/test_gui_http.py` (drives a real `go_gui_cli` over HTTP, including
+  model-backed `/api/evaluate`).
+- The GnuGo arena variant now runs the opponent as
+  `gtp:gnugo --mode gtp --quiet --level 1`: the test covers the external GTP
+  subprocess path, not GnuGo's strength, and full-strength games no longer fit
+  the ctest budget now that GNU Go 3.8 is actually installed on this machine.
+
+### Fixed
+
+- External GTP opponents whose `genmove` answers with an upper-case `PASS`
+  (GNU Go 3.8 does) aborted the match with "invalid vertex". Pass/resign tokens
+  are now matched case-insensitively in `go::arena_engine`.
+
 ## [0.3.1] - 2026-10-25
 
 ### Fixed

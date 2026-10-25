@@ -12,6 +12,7 @@ with the dependency baseline before changing a third-party component.
 | [Third-party selection](design/07-third-party-selection.md) | Responsibilities and boundaries of KataGo, neuralnet.cpp, and Python tools |
 | [Data and feature format](design/08-data-and-features.md) | `.nngames`, GoTokenizer, `.nnvocab`, and feature-plane contracts |
 | [M4 training cache](design/09-training-cache.md) | Versioned `.ngf` cache and C validator data flow |
+| [GUI (play + arena)](design/10-gui.md) | Local play/arena GUI, engine specs, and the HTTP contract |
 | [Dependencies](../DEPENDENCIES.md) | Exact versions, commits, licenses, and upgrade gates |
 | [Contributing](../CONTRIBUTING.md) | Build, test, dependency, and data-artifact rules |
 
@@ -28,6 +29,7 @@ with the dependency baseline before changing a third-party component.
 | [07-third-party-selection.md](design/07-third-party-selection.md) | Current | Library boundaries |
 | [08-data-and-features.md](design/08-data-and-features.md) | Current | Data and feature contracts |
 | [09-training-cache.md](design/09-training-cache.md) | Current | M4 `.ngf` cache format |
+| [10-gui.md](design/10-gui.md) | Current | 对弈室 GUI：对弈 + 竞技台与 HTTP 契约 |
 
 Document 04 is intentionally absent. It was never created; numbering is kept
 stable so existing links do not change.
