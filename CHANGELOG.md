@@ -4,6 +4,26 @@ All notable project changes are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning once public model or data formats are declared stable.
 
+## [0.3.1] - 2026-10-25
+
+### Fixed
+
+- `go_arena_cli` external GTP opponents were unusable on Windows: `spawn()`
+  wired the two `CreatePipe` calls crossed — the child's stdin and stdout ended
+  up on the same pipe — so the parent read EOF before the first response while
+  the child leaked for good. Holding the host's stderr handle, that orphan kept
+  `subprocess.run(capture_output=True)` blocked past its timeout and turned
+  `go_gtp_arena_m6` into a 600 s ctest timeout. Pipe ends are now paired
+  correctly and `reap()` terminates a child that outlives its 5 s grace period
+  (same semantics as the existing POSIX `SIGKILL` path).
+
+### Changed
+
+- M6 acceptance scope corrected in `docs/benchmarks/m6-gtp-arena.md`: the
+  external GTP subprocess path had only been validated through the POSIX fork
+  path. The Windows path is now fixed and re-verified on the CMP 40HX
+  (ctest 12/12, 2026-10-25).
+
 ## [0.3.0] - 2026-10-24
 
 ### Added

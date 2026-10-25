@@ -110,7 +110,8 @@ CTest 两个（`tests/test_m6_features.py` 4 例 +
 
 - 测试里用**我们自己的 `go_gtp_cli` 作为外部 GTP 子进程**，走与
   gnugo 完全相同的管道路径（boardsize/clear_board/komi/play 转发 +
-  genmove 解析 + 退出回收），证明子进程机制可用；
+  genmove 解析 + 退出回收），证明子进程机制可用（⚠ 本条当时只在 Linux
+  路径上验证过；Windows 路径的缺陷与复验见 §10）；
 - `GnuGoArenaTests` 在装有 gnugo 的机器上自动激活
   （`shutil.which("gnugo")`）。
 
@@ -138,3 +139,27 @@ build/cpu/go_arena_cli --player model:artifacts/model.nnmodel \
   （无搜索、无合法性训练），棋力评估属于 M8/M9；
 - GTP 适配器当前不做 time control（`time_settings` 应答但不生效），
   M8 之前无搜索，无时钟需求。
+
+## 10. 2026-10-25 补记：Windows 子进程路径缺陷与 40HX 复验
+
+§7 "子进程机制可用"的结论**只对 Linux `fork()+exec()` 路径成立**（§1 的
+实测环境）。Windows 的 `CreateProcessA` 分支存在管道接线缺陷，此前一直
+未暴露——40HX 机器上 CMake 未找到 Python 解释器，`go_gtp_arena_m6` 等
+Python 验收测试从未被注册、也就从未在 Windows 上跑过；本次显式传
+`-DGO_PYTHON_EXECUTABLE` 后首次运行即挂死。
+
+- **缺陷**（`src/go/go_arena_cli.cpp` `spawn()`）：两次 `CreatePipe` 的
+  读/写端与变量名交叉错位，子进程 stdin/stdout 被接到同一根管道；父进程
+  写命令写入管道读端（失败）、读响应读管道写端（立即 EOF）→ arena 报
+  `gtp engine closed without responding to 'boardsize 19'` 退出；子进程
+  自持 stdin 写端副本而永不退出，`reap()` 的 Windows 分支又只
+  `WaitForSingleObject(5s)` 不强杀 → 孤儿继承宿主 stderr 句柄 → 测试里
+  `subprocess.run(capture_output=True)` 永远等不到 EOF（`communicate()`
+  阻塞，240s timeout 无效）→ ctest 600s 超时。
+- **修复**：① 两条管道两端各自成对（`to_child_read/write`、
+  `from_child_read/write`）；② `reap()` 超时后 `TerminateProcess`，与
+  Linux 分支的 `SIGKILL` 同语义，不再留孤儿。
+- **复验**（`ethan@192.168.1.102`，Windows + CMP 40HX，`build/gpu` Release，
+  2026-10-25）：全量 CTest **12/12 通过**——`go_gtp_arena_m6` 262.1s 正常
+  跑完（修复前 600s 超时），M5 续训 93.4s、M7 B 模型 12.9s 同批通过，
+  对局结束无子进程残留。
