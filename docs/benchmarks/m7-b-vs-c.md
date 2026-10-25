@@ -124,8 +124,17 @@ into the conv stem. Same 910-game cache, batch 32, 4 epochs:
 | best | 8.23% (still climbing) | **10.00%** (epoch 5) |
 
 The fallback lifts B from 5.7% to 8.2% (+2.5 pp) and closes most of the gap,
-but C is still ahead by ~1.2 pp at equal epochs. B is still improving when the
-run ends, so the remaining question is the ceiling, not the trend.
+but C is still ahead by ~1.8 pp. Extending B+CNN to the same 6-epoch cosine
+schedule C used does **not** help (6.19 / 5.86 / 6.92 / 6.57 / 7.47 / 7.85 %,
+best 7.85% at epoch 6) — the 4-epoch schedule happened to land on a better
+point, and neither reaches C's 10.00%.
+
+Head-to-head on the 910-game models is still lopsided:
+`go_arena_cli --player model:m9-c.nnmodel --opponent model:m9-bcnn.nnmodel
+--games 20` → **C 20, B+CNN 0**.
+
+Verdict at this scale: B (with or without the design fallback) does not beat C.
+The remaining levers are data scale (M9) and a wider model, not tuning.
 
 ### B at 20 epochs (same 110-game cache, 40HX)
 
