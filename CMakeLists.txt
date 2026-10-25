@@ -95,7 +95,9 @@ add_executable(go_rules_cli src/go/rules_cli.cpp)
 target_link_libraries(go_rules_cli PRIVATE go_rules go_katago_game)
 
 add_library(go_nngames STATIC src/go/nngames.cpp)
-target_link_libraries(go_nngames PUBLIC go_rules PRIVATE neuralnet::nn)
+# 并行重放校验（verify_replay 的 --threads）用 std::thread。
+find_package(Threads REQUIRED)
+target_link_libraries(go_nngames PUBLIC go_rules Threads::Threads PRIVATE neuralnet::nn)
 
 add_executable(go_data_cli src/go/data_cli.cpp)
 target_link_libraries(go_data_cli PRIVATE go_nngames go_katago_game neuralnet::nn)

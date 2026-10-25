@@ -8,6 +8,24 @@ semantic versioning once public model or data formats are declared stable.
 
 ### Added
 
+- Parallel pipeline operations, with byte-identical output: `ingest` parses
+  SGFs in an ordered process pool, `training-cache` runs `trace-batch`
+  subprocesses concurrently, and `go_data_cli verify` replays games on
+  `--threads N` threads (the summary, including `final_state_hash`, is folded
+  in replay order, so results are bit-identical across thread counts —
+  measured: threads=1 vs threads=8 identical on the full 96k-game
+  collection). All three commands expose `--jobs N` (default: CPU count;
+  `--jobs 1` keeps the serial path).
+- `ingest --limit 0` converts every usable 19x19 game (no limit).
+- Bad-game drop policy for `ingest`: games that fail KataGo replay are no
+  longer fatal. `go_data_cli verify --skip-unreplayable` lists them under
+  `skipped_games`; ingest drops them from the JSONL, re-packs, re-verifies
+  strictly, and records them under `dropped` in the manifest (the full CWI
+  collection contains 12 such games, e.g. `unusual/suicide_1`; the pinned
+  10k dataset is unaffected — re-verified byte-identical). Duplicate game
+  ids are dropped at parse time (pack would otherwise fail hard).
+- `go-pipeline verify --skip-unreplayable` passthrough for diagnosing large
+  collections.
 - `docs/tutorials/training.md`: end-to-end training tutorial (dataset download
   and SHA-256 verification, `.nngames` ingest, `.ngf` caches, B-model training,
   resume gates, evaluation), including the recovery procedure for an archive
@@ -35,6 +53,8 @@ semantic versioning once public model or data formats are declared stable.
   (gpu-preset-only checkouts work without extra flags), a new `--build-dir`
   option pins the directory explicitly, and a missing binary now raises a
   clear error listing the tried paths.
+- `ingest` subprocess failures (`pack`/`verify`) now surface the child
+  process's stderr instead of a bare `returned non-zero exit status 1`.
 
 ## [0.5.0] - 2026-10-25
 

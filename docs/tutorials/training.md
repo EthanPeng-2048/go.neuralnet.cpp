@@ -138,12 +138,24 @@ Release 资产视为不可变：改动它会破坏所有已记录的身份。
 ```bash
 .venv/bin/go-pipeline ingest --limit 10000
 .venv/bin/go-pipeline verify --sample 1000
+
+# 全量转换：--limit 0 = 不设上限；--jobs 自动并行（默认 = CPU 数，
+# 输出与串行逐位一致）
+.venv/bin/go-pipeline ingest --limit 0 --jobs 8
 ```
 
 `ingest` 过滤出 19×19 对局，经 KataGo 规则编码为
 `data/cwi-10k.nngames`，并在 `data/cwi-10k.nngames.manifest.json` 里记录
 对局数、手数、数据集 SHA-256 与归档 SHA-256。`verify` 做逐字节可逆 +
-抽样 KataGo 重放验收。当前钉死口径（M2/M3 实测）：
+KataGo 重放验收（`--threads N` 并行重放，结果与串行逐位一致）。
+
+**坏棋局直接抛弃**：全量数据里存在无法按规则重放的棋谱（CWI 全集实测
+12 局，如 `unusual/suicide_1`、`Kisei/23/F4a`）。`ingest` 会自动剔除
+它们、重新打包并严格复验，剔除清单记入 manifest 的 `dropped` 字段；
+重复 id 的棋谱同样在解析阶段丢弃。排查时可用
+`go-pipeline verify --skip-unreplayable` 列出坏局而不报错。
+
+当前钉死口径（M2/M3 实测）：
 
 | 项 | 值 |
 |---|---:|
@@ -160,8 +172,11 @@ Release 资产视为不可变：改动它会破坏所有已记录的身份。
 ```bash
 .venv/bin/go-pipeline training-cache \
   --max-games 1000 --eval-games 100 --seed 20261024 \
-  --history-len 64 --manifest .cache/cache-manifest.json
+  --history-len 64 --jobs 8 --manifest .cache/cache-manifest.json
 ```
+
+`--jobs`（默认 = CPU 数）并发跑 KataGo `trace-batch` 子进程，写盘仍按
+原 chunk 序 ⇒ `.ngf` 字节与串行完全一致。
 
 管线按固定 seed 抽对局、用 KataGo 重放生成 9 平面特征、策略标签、价值
 标签与最近 K=64 手历史，写成只读 `.ngf` 缓存（格式见
@@ -266,6 +281,8 @@ loss 绝对值不可比 —— B/C 对照请用同一份 `.ngf` 缓存比 eval t
 | `vkAllocateMemory failed`（GPU） | batch 超出显存 | 降 `--batch-size`（850M 实测 16 可行、32 不行） |
 | `only found N usable 19x19 games` | 数据集不足 `--limit` 局 | 降低 `--limit` 或换数据源（换源按 §2.2 上游变更流程） |
 | `找不到 go_data_cli`（FileNotFoundError） | 只构建了 `gpu` preset（旧版写死 `build/cpu`） | 新版自动探测 `build/gpu`；或 `--build-dir build/gpu`；或 `--data-cli/--rules-cli` 直接给路径 |
+| 全量 `ingest` 报 `cannot replay move N in game …` | 数据集含无法按规则重放的坏棋谱（CWI 全集 12 局） | 新版自动抛弃这些棋局并记入 manifest `dropped`；排查用 `go-pipeline verify --skip-unreplayable` |
+| 全量 `verify` 太慢 | 重放 + 容器往返都随数据量线性增长 | `verify --threads N`（或 `go-pipeline verify --jobs N`）并行重放；注意容器 parse/serialize 目前仍是单线程 |
 
 ## 相关文档
 

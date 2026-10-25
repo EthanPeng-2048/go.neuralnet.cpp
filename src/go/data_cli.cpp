@@ -299,6 +299,7 @@ int verify(int argc, char** argv) {
     std::string path;
     std::optional<std::size_t> sample;
     std::uint64_t seed = 0;
+    go::ReplayOptions replay_options;
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--input") {
@@ -307,6 +308,16 @@ int verify(int argc, char** argv) {
             sample = static_cast<std::size_t>(std::stoull(option_value(i, argc, argv)));
         } else if (arg == "--seed") {
             seed = std::stoull(option_value(i, argc, argv));
+        } else if (arg == "--threads") {
+            replay_options.threads =
+                static_cast<std::size_t>(std::stoull(option_value(i, argc, argv)));
+            if (replay_options.threads == 0) {
+                throw std::invalid_argument("--threads must be positive");
+            }
+        } else if (arg == "--skip-unreplayable") {
+            // 容错模式：不可重放的棋局不抛错，列入 skipped_games
+            // （供 ingest 剔除坏局后重新打包）。
+            replay_options.skip_unreplayable = true;
         } else {
             throw std::invalid_argument("unknown verify option: " + std::string(arg));
         }
@@ -325,7 +336,13 @@ int verify(int argc, char** argv) {
     };
     const go::GameDataset dataset = go::parse_nngames(bytes);
     const bool byte_identical = go::serialize_nngames(dataset) == bytes;
-    const go::ReplaySummary replay = go::verify_replay(dataset, sample, seed);
+    const go::ReplaySummary replay =
+        go::verify_replay(dataset, sample, seed, replay_options);
+    json skipped = json::array();
+    for (const go::SkippedReplay& entry : replay.skipped) {
+        skipped.push_back(json{
+            {"index", entry.index}, {"id", entry.id}, {"reason", entry.reason}});
+    }
     std::cout << json{
         {"games", dataset.games.size()},
         {"byte_identical", byte_identical},
@@ -334,6 +351,8 @@ int verify(int argc, char** argv) {
         {"setup_stones", replay.setup_stones},
         {"captures", replay.captures},
         {"final_state_hash", replay.final_state_hash},
+        {"threads", replay_options.threads},
+        {"skipped_games", std::move(skipped)},
     }.dump() << '\n';
     if (!byte_identical) {
         throw std::runtime_error("nngames serialization is not byte-reversible");
@@ -501,7 +520,8 @@ void usage(const char* program) {
         << "usage:\n"
         << "  " << program << " pack --input JSONL --output FILE --source-name NAME [...]\n"
         << "  " << program << " stats --input FILE\n"
-        << "  " << program << " verify --input FILE [--sample N --seed S]\n"
+        << "  " << program << " verify --input FILE [--sample N --seed S]"
+           " [--threads N] [--skip-unreplayable]\n"
         << "  " << program << " export --input FILE --index N\n"
         << "  " << program << " export-range --input FILE [--start N] --limit N\n"
         << "  " << program << " write-vocab --output FILE\n"

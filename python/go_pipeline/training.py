@@ -5,8 +5,11 @@ import json
 import random
 import struct
 import subprocess
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 
@@ -193,6 +196,42 @@ def _samples_for_game(
     return samples
 
 
+def _trace_chunks(
+    chunks: list[list[tuple[int, GameRecord]]],
+    rules_cli: Path,
+    jobs: int,
+) -> Iterator[list[dict[str, object]]]:
+    """按 chunk 原序产出 trace（每元素 = 该 32 局 chunk 的 trace 列表）。
+
+    jobs=1：串行起 trace-batch 子进程（原行为）。jobs>1：线程池并发跑
+    子进程（subprocess 不占 GIL），最多 jobs 个 chunk 在飞；消费端按
+    chunk 序取结果 ⇒ 写盘顺序、sample_id 序列与串行逐位一致。
+    """
+    if jobs <= 1:
+        for chunk in chunks:
+            yield trace_records([record for _, record in chunk], rules_cli)
+        return
+    iterator = iter(chunks)
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        pending: deque[Future[list[dict[str, object]]]] = deque()
+
+        def submit_next() -> bool:
+            chunk = next(iterator, None)
+            if chunk is None:
+                return False
+            pending.append(
+                pool.submit(trace_records, [record for _, record in chunk], rules_cli)
+            )
+            return True
+
+        for _ in range(jobs):
+            if not submit_next():
+                break
+        while pending:
+            yield pending.popleft().result()
+            submit_next()
+
+
 def write_feature_cache(
     output: Path,
     *,
@@ -200,6 +239,7 @@ def write_feature_cache(
     records: list[tuple[int, GameRecord]],
     rules_cli: Path,
     history_len: int = DEFAULT_HISTORY_LEN,
+    jobs: int = 1,
 ) -> CacheBuildResult:
     if history_len <= 0:
         raise ValueError("history_len must be positive")
@@ -223,9 +263,10 @@ def write_feature_cache(
     with temporary.open("wb") as stream:
         stream.write(header)
         sample_id = 0
-        for chunk_start in range(0, len(records), 32):
-            chunk = records[chunk_start : chunk_start + 32]
-            traces = trace_records([record for _, record in chunk], rules_cli)
+        chunks = [records[start : start + 32] for start in range(0, len(records), 32)]
+        for chunk, traces in zip(
+            chunks, _trace_chunks(chunks, rules_cli, jobs), strict=True
+        ):
             for (game_index, record), trace in zip(chunk, traces, strict=True):
                 try:
                     game_samples = _samples_for_game(
@@ -306,6 +347,7 @@ def build_training_caches(
     eval_games: int,
     seed: int,
     history_len: int = DEFAULT_HISTORY_LEN,
+    jobs: int = 1,
 ) -> dict[str, object]:
     if max_games <= 0:
         raise ValueError("max_games must be positive")
@@ -334,6 +376,7 @@ def build_training_caches(
         records=train_records,
         rules_cli=rules_cli,
         history_len=history_len,
+        jobs=jobs,
     )
     evaluation = write_feature_cache(
         eval_output,
@@ -341,6 +384,7 @@ def build_training_caches(
         records=eval_records,
         rules_cli=rules_cli,
         history_len=history_len,
+        jobs=jobs,
     )
     return {
         "format": "go.feature-cache",

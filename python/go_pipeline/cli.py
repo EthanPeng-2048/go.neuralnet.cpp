@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -88,6 +89,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         limit=args.limit,
         sample_size=args.sample,
         seed=args.seed,
+        jobs=resolve_jobs(args.jobs),
     )
     print(orjson.dumps(manifest, option=orjson.OPT_INDENT_2).decode())
 
@@ -105,6 +107,9 @@ def cmd_verify(args: argparse.Namespace) -> None:
     ]
     if args.sample:
         command.extend(["--sample", str(args.sample)])
+    command.extend(["--threads", str(resolve_jobs(args.jobs))])
+    if args.skip_unreplayable:
+        command.append("--skip-unreplayable")
     result = subprocess.run(command, check=True, text=True, capture_output=True)
     print(result.stdout, end="")
 
@@ -201,12 +206,27 @@ def cmd_training_cache(args: argparse.Namespace) -> None:
         eval_games=args.eval_games,
         seed=args.seed,
         history_len=args.history_len,
+        jobs=resolve_jobs(args.jobs),
     )
     if args.manifest:
         manifest_path = Path(args.manifest).resolve()
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_bytes(orjson.dumps(manifest, option=orjson.OPT_INDENT_2))
     print(orjson.dumps(manifest, option=orjson.OPT_INDENT_2).decode())
+
+
+def resolve_jobs(value: int) -> int:
+    """--jobs：0（默认）= CPU 数；1 = 串行；>1 = 显式并行度。"""
+    return value if value > 0 else (os.cpu_count() or 1)
+
+
+def add_jobs_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=0,
+        help="并行度（默认 0 = CPU 数；1 = 串行；输出与串行逐位一致）",
+    )
 
 
 def add_build_dir_option(parser: argparse.ArgumentParser) -> None:
@@ -232,7 +252,8 @@ def parser() -> argparse.ArgumentParser:
     ingest.add_argument("--output")
     ingest.add_argument("--data-cli")
     add_build_dir_option(ingest)
-    ingest.add_argument("--limit", type=int, default=10_000)
+    add_jobs_option(ingest)
+    ingest.add_argument("--limit", type=int, default=10_000, help="最多导入的 19×19 对局数（0 = 全部）")
     ingest.add_argument("--sample", type=int, default=500)
     ingest.add_argument("--seed", type=int, default=20261024)
     ingest.set_defaults(func=cmd_ingest)
@@ -241,6 +262,12 @@ def parser() -> argparse.ArgumentParser:
     verify.add_argument("--dataset")
     verify.add_argument("--data-cli")
     add_build_dir_option(verify)
+    add_jobs_option(verify)
+    verify.add_argument(
+        "--skip-unreplayable",
+        action="store_true",
+        help="不可重放的棋局列入 skipped_games 而不是报错（用于排查坏数据）",
+    )
     verify.add_argument("--sample", type=int, default=500)
     verify.add_argument("--seed", type=int, default=20261024)
     verify.set_defaults(func=cmd_verify)
@@ -270,6 +297,7 @@ def parser() -> argparse.ArgumentParser:
     cache.add_argument("--data-cli")
     cache.add_argument("--rules-cli")
     add_build_dir_option(cache)
+    add_jobs_option(cache)
     cache.add_argument("--train-output")
     cache.add_argument("--eval-output")
     cache.add_argument("--manifest")

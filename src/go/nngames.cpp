@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -369,7 +371,8 @@ void save_nngames(const GameDataset& dataset, const std::string& path) {
 ReplaySummary verify_replay(
     const GameDataset& dataset,
     std::optional<std::size_t> random_sample,
-    std::uint64_t seed
+    std::uint64_t seed,
+    const ReplayOptions& options
 ) {
     std::vector<std::size_t> indices(dataset.games.size());
     for (std::size_t i = 0; i < indices.size(); ++i) {
@@ -380,43 +383,113 @@ ReplaySummary verify_replay(
         std::shuffle(indices.begin(), indices.end(), rng);
         indices.resize(*random_sample);
     }
+    const std::size_t count = indices.size();
+
+    // 单局重放结果槽。每局棋相互独立（Game 的 Impl 归本局所有，
+    // KataGo 的 makeBoardMoveTolerant 不碰共享可变状态），可按局并发
+    // 填各自的槽；之后按重放序串行折叠，保证汇总值（尤其
+    // final_state_hash 的逐字节混合序）与线程数、完成顺序逐位无关。
+    struct Slot {
+        std::size_t replayed_moves = 0;
+        std::size_t setup_stones = 0;
+        std::size_t captures = 0;
+        std::string final_ascii;
+        std::string failure;  // 空 = 该局重放成功
+    };
+    std::vector<Slot> slots(count);
+
+    auto replay_one = [&dataset, &indices, &slots](std::size_t position) {
+        const GameRecord& record = dataset.games[indices[position]];
+        Slot& slot = slots[position];
+        try {
+            Game game = Game::from_ascii(
+                setup_ascii(record),
+                record.to_move,
+                rules_for(record)
+            );
+            slot.setup_stones = record.setup_black.size()
+                + record.setup_white.size() + record.setup_empty.size();
+
+            for (const std::uint64_t token : record.moves) {
+                const PlayedMove move = decode_move(token);
+                if (!game.play_tolerant(move.color, move.point)) {
+                    slot.failure =
+                        "cannot replay move "
+                        + std::to_string(game.move_count() + 1)
+                        + " in game " + record.id;
+                    return;
+                }
+                ++slot.replayed_moves;
+            }
+
+            const std::vector<PlayedMove> history = game.history();
+            if (history.size() != record.moves.size()) {
+                slot.failure = "history length mismatch in game: " + record.id;
+                return;
+            }
+            for (std::size_t i = 0; i < history.size(); ++i) {
+                if (encode_move(history[i].color, history[i].point)
+                    != record.moves[i]) {
+                    slot.failure =
+                        "history value mismatch in game: " + record.id;
+                    return;
+                }
+            }
+            slot.captures = static_cast<std::size_t>(
+                game.captured_count(Stone::black)
+                + game.captured_count(Stone::white)
+            );
+            slot.final_ascii = game.ascii();
+        } catch (const std::exception& error) {
+            // 严格模式下这条消息会被原样抛出（类型统一为
+            // runtime_error）；容错模式下作为该局的剔除原因。
+            slot.failure = error.what();
+        }
+    };
+
+    const std::size_t workers = std::min(options.threads, count);
+    if (workers <= 1) {
+        for (std::size_t position = 0; position < count; ++position) {
+            replay_one(position);
+        }
+    } else {
+        std::atomic<std::size_t> cursor{0};
+        std::vector<std::thread> pool;
+        pool.reserve(workers);
+        for (std::size_t worker = 0; worker < workers; ++worker) {
+            pool.emplace_back([&] {
+                while (true) {
+                    const std::size_t position = cursor.fetch_add(1);
+                    if (position >= count) {
+                        break;
+                    }
+                    replay_one(position);
+                }
+            });
+        }
+        for (std::thread& thread : pool) {
+            thread.join();
+        }
+    }
 
     ReplaySummary summary;
-    summary.sampled_games = indices.size();
-    for (const std::size_t index : indices) {
-        const GameRecord& record = dataset.games[index];
-        Game game = Game::from_ascii(
-            setup_ascii(record),
-            record.to_move,
-            rules_for(record)
-        );
-        summary.setup_stones +=
-            record.setup_black.size() + record.setup_white.size() + record.setup_empty.size();
-
-        for (const std::uint64_t token : record.moves) {
-            const PlayedMove move = decode_move(token);
-            if (!game.play_tolerant(move.color, move.point)) {
-                throw std::runtime_error(
-                    "cannot replay move " + std::to_string(game.move_count() + 1)
-                    + " in game " + record.id
-                );
+    summary.sampled_games = count;
+    for (std::size_t position = 0; position < count; ++position) {
+        Slot& slot = slots[position];
+        if (!slot.failure.empty()) {
+            if (!options.skip_unreplayable) {
+                // 严格模式：抛重放序中第一个失败 ⇒ 与串行逐位同语义。
+                throw std::runtime_error(slot.failure);
             }
-            ++summary.replayed_moves;
+            summary.skipped.push_back(SkippedReplay{
+                indices[position], dataset.games[indices[position]].id,
+                slot.failure});
+            continue;
         }
-
-        const std::vector<PlayedMove> history = game.history();
-        if (history.size() != record.moves.size()) {
-            throw std::runtime_error("history length mismatch in game: " + record.id);
-        }
-        for (std::size_t i = 0; i < history.size(); ++i) {
-            if (encode_move(history[i].color, history[i].point) != record.moves[i]) {
-                throw std::runtime_error("history value mismatch in game: " + record.id);
-            }
-        }
-        summary.captures += static_cast<std::size_t>(
-            game.captured_count(Stone::black) + game.captured_count(Stone::white)
-        );
-        for (const unsigned char c : game.ascii()) {
+        summary.replayed_moves += slot.replayed_moves;
+        summary.setup_stones += slot.setup_stones;
+        summary.captures += slot.captures;
+        for (const unsigned char c : slot.final_ascii) {
             hash_mix(summary.final_state_hash, c);
         }
     }

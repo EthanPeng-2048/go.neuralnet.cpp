@@ -56,12 +56,30 @@ struct GameDataset {
     std::vector<GameRecord> games;
 };
 
+// 重放校验的行为开关。默认值 = 原语义：单线程、首个失败即抛。
+struct ReplayOptions {
+    // 并发重放的线程数（1 = 串行）。每局棋相互独立，按局分配；
+    // final_state_hash 仍按重放序串行折叠 ⇒ 与线程数逐位无关。
+    std::size_t threads = 1;
+    // true = 不可重放的棋局不抛错，记入 summary.skipped（供上层
+    // 「坏局直接抛弃」策略剔除后重新打包）。
+    bool skip_unreplayable = false;
+};
+
+struct SkippedReplay {
+    std::size_t index = 0;  // dataset 下标
+    std::string id;
+    std::string reason;
+};
+
 struct ReplaySummary {
     std::size_t sampled_games = 0;
     std::size_t replayed_moves = 0;
     std::size_t setup_stones = 0;
     std::size_t captures = 0;
     std::uint64_t final_state_hash = 1469598103934665603ULL;
+    // 仅 skip_unreplayable 模式下非空；严格模式下失败直接抛错。
+    std::vector<SkippedReplay> skipped;
 };
 
 [[nodiscard]] std::uint64_t encode_move(Stone color, std::optional<Point> point);
@@ -77,7 +95,8 @@ void save_nngames(const GameDataset& dataset, const std::string& path);
 [[nodiscard]] ReplaySummary verify_replay(
     const GameDataset& dataset,
     std::optional<std::size_t> random_sample,
-    std::uint64_t seed
+    std::uint64_t seed,
+    const ReplayOptions& options = {}
 );
 
 }  // namespace go
