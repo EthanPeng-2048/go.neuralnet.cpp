@@ -107,6 +107,26 @@ Ablation: `--value-weight 0` (policy-only) made it worse — epoch 1 2.41%,
 epoch 2 1.36% with the training loss *rising* (5.28 → 5.45). The value head is
 not the problem; it acts as an auxiliary task that stabilises the trunk.
 
+### The design §3.1 fallback: CNN-direct policy logits
+
+The 910-game probe showed B underfitting through the attention-query bottleneck,
+so the design's documented fallback was implemented (`--cnn-policy 1`): the
+stem's feature map `(d·25, batch)` goes through a `Linear(d·25 → 362)` whose
+logits are added to the query logits, giving the policy head a short path back
+into the conv stem. Same 910-game cache, batch 32, 4 epochs:
+
+| Epoch | B + CNN policy, top-1 | (for reference) C top-1 |
+|---:|---:|---:|
+| 1 | 6.65% | 6.04% |
+| 2 | 7.50% | 7.40% |
+| 3 | 7.77% | 8.80% |
+| 4 | **8.23%** | 9.43% |
+| best | 8.23% (still climbing) | **10.00%** (epoch 5) |
+
+The fallback lifts B from 5.7% to 8.2% (+2.5 pp) and closes most of the gap,
+but C is still ahead by ~1.2 pp at equal epochs. B is still improving when the
+run ends, so the remaining question is the ceiling, not the trend.
+
 ### B at 20 epochs (same 110-game cache, 40HX)
 
 Training longer does not close the gap — it memorises:
