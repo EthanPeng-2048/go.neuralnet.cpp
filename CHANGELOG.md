@@ -28,6 +28,14 @@ semantic versioning once public model or data formats are declared stable.
   source collection's public-domain terms, outside the repository's
   LGPL-3.0-only license; see `THIRD_PARTY_NOTICES.md`.
 
+### Fixed
+
+- `go-pipeline` no longer hardcodes `build/cpu`: `go_data_cli` /
+  `go_rules_cli` are resolved by probing `build/cpu` then `build/gpu`
+  (gpu-preset-only checkouts work without extra flags), a new `--build-dir`
+  option pins the directory explicitly, and a missing binary now raises a
+  clear error listing the tried paths.
+
 ## [0.5.0] - 2026-10-25
 
 ### Added

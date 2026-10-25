@@ -19,14 +19,17 @@ cmake --build --preset cpu
 ctest --preset cpu --output-on-failure
 ```
 
-教程命令依赖以下已构建产物（`--preset gpu` 时把 `build/cpu` 换成 `build/gpu`）：
+教程命令依赖以下已构建产物。`go-pipeline` 自动探测 CLI 所在的构建目录
+（先 `build/cpu`，再 `build/gpu`；也可用 `--build-dir build/gpu` 显式
+指定，只用 GPU preset 的构建同样直接可用）；直接调用
+`./build/cpu/go_train_cli` 这类二进制路径时，按你的 preset 换对应目录：
 
 | 产物 | 作用 |
 |---|---|
 | `.venv/bin/go-pipeline` | 数据管线（下载/入库/验收/词表/特征/训练缓存） |
-| `build/cpu/go_data_cli` | `.nngames` 打包、校验、导出 |
-| `build/cpu/go_rules_cli` | KataGo 规则回放与轨迹 |
-| `build/cpu/go_train_cli` | 训练、续训、评估（neuralnet.cpp） |
+| `build/<preset>/go_data_cli` | `.nngames` 打包、校验、导出 |
+| `build/<preset>/go_rules_cli` | KataGo 规则回放与轨迹 |
+| `build/<preset>/go_train_cli` | 训练、续训、评估（neuralnet.cpp） |
 
 ## 1. 链路总览
 
@@ -262,6 +265,7 @@ loss 绝对值不可比 —— B/C 对照请用同一份 `.ngf` 缓存比 eval t
 | `--epochs 与断点配方不一致` | 续训时改了总 epoch 数 | 用与断点相同的 `--epochs`；真要改配方就重开一轮 |
 | `vkAllocateMemory failed`（GPU） | batch 超出显存 | 降 `--batch-size`（850M 实测 16 可行、32 不行） |
 | `only found N usable 19x19 games` | 数据集不足 `--limit` 局 | 降低 `--limit` 或换数据源（换源按 §2.2 上游变更流程） |
+| `找不到 go_data_cli`（FileNotFoundError） | 只构建了 `gpu` preset（旧版写死 `build/cpu`） | 新版自动探测 `build/gpu`；或 `--build-dir build/gpu`；或 `--data-cli/--rules-cli` 直接给路径 |
 
 ## 相关文档
 

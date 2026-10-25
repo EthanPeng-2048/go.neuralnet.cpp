@@ -27,12 +27,39 @@ def default_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def data_cli_path(root: Path, value: str | None) -> Path:
-    return Path(value).resolve() if value else root / "build/cpu/go_data_cli"
+# CLI 可执行文件解析：显式 --data-cli/--rules-cli > --build-dir >
+# 自动探测 build/cpu（默认 preset），再探测 build/gpu（gpu-only 用户）。
+BUILD_DIR_CANDIDATES = ("build/cpu", "build/gpu")
 
 
-def rules_cli_path(root: Path, value: str | None) -> Path:
-    return Path(value).resolve() if value else root / "build/cpu/go_rules_cli"
+def resolve_cli(
+    root: Path, value: str | None, name: str, build_dir: str | None
+) -> Path:
+    if value:
+        return Path(value).resolve()
+    directories = (
+        [root / build_dir]
+        if build_dir
+        else [root / candidate for candidate in BUILD_DIR_CANDIDATES]
+    )
+    for directory in directories:
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate.resolve()
+    tried = ", ".join(str(directory / name) for directory in directories)
+    raise FileNotFoundError(
+        f"找不到 {name}（尝试过：{tried}）。先构建 "
+        "(cmake --preset cpu|gpu && cmake --build --preset cpu|gpu)，"
+        "或用 --build-dir 指定构建目录，或用 --data-cli/--rules-cli 直接给路径。"
+    )
+
+
+def data_cli_path(root: Path, value: str | None, build_dir: str | None = None) -> Path:
+    return resolve_cli(root, value, "go_data_cli", build_dir)
+
+
+def rules_cli_path(root: Path, value: str | None, build_dir: str | None = None) -> Path:
+    return resolve_cli(root, value, "go_rules_cli", build_dir)
 
 
 def cmd_download(args: argparse.Namespace) -> None:
@@ -56,7 +83,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         games_root=games_root,
         archive=archive,
         output=output,
-        data_cli=data_cli_path(root, args.data_cli),
+        data_cli=data_cli_path(root, args.data_cli, args.build_dir),
         work_dir=root / ".cache",
         limit=args.limit,
         sample_size=args.sample,
@@ -69,7 +96,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
     root = default_root()
     dataset = Path(args.dataset or root / "data/cwi-10k.nngames").resolve()
     command = [
-        str(data_cli_path(root, args.data_cli)),
+        str(data_cli_path(root, args.data_cli, args.build_dir)),
         "verify",
         "--input",
         str(dataset),
@@ -85,7 +112,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
 def cmd_tokenizer(args: argparse.Namespace) -> None:
     root = default_root()
     output = Path(args.output or root / "data/go.nnvocab").resolve()
-    GoTokenizer().save(output, data_cli_path(root, args.data_cli))
+    GoTokenizer().save(output, data_cli_path(root, args.data_cli, args.build_dir))
     print(json.dumps({"vocabulary": str(output), "vocab_size": 367}, indent=2))
 
 
@@ -94,7 +121,7 @@ def cmd_features(args: argparse.Namespace) -> None:
     dataset = Path(args.dataset or root / "data/cwi-10k.nngames").resolve()
     exported = subprocess.run(
         [
-            str(data_cli_path(root, args.data_cli)),
+            str(data_cli_path(root, args.data_cli, args.build_dir)),
             "export",
             "--input",
             str(dataset),
@@ -126,7 +153,7 @@ def cmd_features(args: argparse.Namespace) -> None:
         setup_empty=tuple(value["setup_empty"]),
         moves=tuple(value["moves"]),
     )
-    trace = trace_record(record, rules_cli_path(root, args.rules_cli))
+    trace = trace_record(record, rules_cli_path(root, args.rules_cli, args.build_dir))
     frames = trace["frames"]
     frame_index = args.frame if args.frame is not None else max(0, len(frames) // 2)
     sample = sample_from_trace(trace, frame_index=frame_index, record=record)
@@ -166,8 +193,8 @@ def cmd_training_cache(args: argparse.Namespace) -> None:
     ).resolve()
     manifest = build_training_caches(
         dataset=dataset,
-        data_cli=data_cli_path(root, args.data_cli),
-        rules_cli=rules_cli_path(root, args.rules_cli),
+        data_cli=data_cli_path(root, args.data_cli, args.build_dir),
+        rules_cli=rules_cli_path(root, args.rules_cli, args.build_dir),
         train_output=train_output,
         eval_output=eval_output,
         max_games=args.max_games,
@@ -180,6 +207,13 @@ def cmd_training_cache(args: argparse.Namespace) -> None:
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_bytes(orjson.dumps(manifest, option=orjson.OPT_INDENT_2))
     print(orjson.dumps(manifest, option=orjson.OPT_INDENT_2).decode())
+
+
+def add_build_dir_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--build-dir",
+        help="构建目录（默认自动探测 build/cpu，其次 build/gpu）",
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -197,6 +231,7 @@ def parser() -> argparse.ArgumentParser:
     ingest.add_argument("--games-root")
     ingest.add_argument("--output")
     ingest.add_argument("--data-cli")
+    add_build_dir_option(ingest)
     ingest.add_argument("--limit", type=int, default=10_000)
     ingest.add_argument("--sample", type=int, default=500)
     ingest.add_argument("--seed", type=int, default=20261024)
@@ -205,6 +240,7 @@ def parser() -> argparse.ArgumentParser:
     verify = sub.add_parser("verify", help="verify KVRecord round-trip and replay")
     verify.add_argument("--dataset")
     verify.add_argument("--data-cli")
+    add_build_dir_option(verify)
     verify.add_argument("--sample", type=int, default=500)
     verify.add_argument("--seed", type=int, default=20261024)
     verify.set_defaults(func=cmd_verify)
@@ -212,12 +248,14 @@ def parser() -> argparse.ArgumentParser:
     tokenizer = sub.add_parser("tokenizer", help="write GoTokenizer .nnvocab")
     tokenizer.add_argument("--output")
     tokenizer.add_argument("--data-cli")
+    add_build_dir_option(tokenizer)
     tokenizer.set_defaults(func=cmd_tokenizer)
 
     features = sub.add_parser("features", help="trace a game and render feature planes")
     features.add_argument("--dataset")
     features.add_argument("--data-cli")
     features.add_argument("--rules-cli")
+    add_build_dir_option(features)
     features.add_argument("--index", type=int, default=0)
     features.add_argument("--frame", type=int)
     features.add_argument("--output")
@@ -231,6 +269,7 @@ def parser() -> argparse.ArgumentParser:
     cache.add_argument("--dataset")
     cache.add_argument("--data-cli")
     cache.add_argument("--rules-cli")
+    add_build_dir_option(cache)
     cache.add_argument("--train-output")
     cache.add_argument("--eval-output")
     cache.add_argument("--manifest")
