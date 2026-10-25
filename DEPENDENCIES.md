@@ -115,11 +115,20 @@ python3 -m venv .venv
 
 | 项目 | 值 |
 |---|---|
-| 地址 | <https://homepages.cwi.nl/~aeb/go/games/games.tgz> |
+| 下载地址（钉死） | <https://github.com/EthanPeng-2048/go.neuralnet.cpp/releases/download/data-cwi-games-v1/cwi-go-games.tgz>（项目 Releases 上的字节快照；`cwi.py` 从此处下载） |
+| 原始上游（provenance） | <https://homepages.cwi.nl/~aeb/go/games/games.tgz>（快照来源；仅记录，不用于下载） |
 | 归档 SHA-256 | `c57ad2ba3c5f3a3ee145bb77bcc9c0167c0d7b5478cf691a8939f750511071e2` |
-| 许可声明 | CWI 页面声明棋谱属于 public domain |
-| 项目消费 | 1 万局 19×19，生成 `.nngames`；原始归档与派生数据不提交 Git |
+| 许可声明 | CWI 页面声明棋谱属于 public domain。Releases 快照是未改动的上游副本，作为数据资产分发：不属于源码树，不受本仓库 LGPL-3.0-only 保护，沿用源许可（public domain） |
+| 项目消费 | 1 万局 19×19，生成 `.nngames`；原始归档与派生数据不提交 Git，快照经 Releases 分发、不占仓库内容 |
 | 数据集 SHA-256 | `bc4ea0c7929350395a0d632f53b2a59f270b6bb7510b3dcd5095c670e49d2313` |
+
+变更记录（2026-10-25）：上游重新发布 `games.tgz`（新 SHA-256
+`9a7e4069407e7ab8b4c5a1214d8027a65f8508ca596de2f4eec4431db439c0c1`，
+仅在 `games/people/Cho_Hunhyun/` 下新增 54 局、无删除无修改；新增文件的
+排序位置在入库扫描窗口 10,066 之外，1 万局数据集身份不受影响）。为免
+上游漂移破坏可复现性，下载点固化为上述 Releases 快照（tag
+`data-cwi-games-v1`，资产即旧版字节，归档/数据集 SHA-256 均不变）。
+跟进上游新增内容属数据集变更：需新 tag、新 SHA-256 与重新验收。
 
 数据的下载、过滤、编码与回放验收见
 [`M2/M3 报告`](docs/benchmarks/m2-m3-data.md)。任何来源许可变化都必须重新审查。

@@ -63,8 +63,16 @@ The archive and generated `.nngames` datasets remain separate from the project
 source license.
 
 - Source: <https://homepages.cwi.nl/~aeb/go/games/games.tgz>
+- Pinned download (byte-stable snapshot):
+  <https://github.com/EthanPeng-2048/go.neuralnet.cpp/releases/download/data-cwi-games-v1/cwi-go-games.tgz>
 - Archive SHA-256:
   `c57ad2ba3c5f3a3ee145bb77bcc9c0167c0d7b5478cf691a8939f750511071e2`
+
+The snapshot on GitHub Releases is a byte-exact copy of the CWI archive,
+published only so that downloads do not depend on upstream drift. It is a
+data asset distributed outside the source tree: it is not part of this
+repository's contents and is not covered by the repository's LGPL-3.0-only
+license; it carries the source collection's own status (public domain).
 
 ## Benchmark references
 

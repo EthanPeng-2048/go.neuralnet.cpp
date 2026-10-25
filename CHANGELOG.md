@@ -15,6 +15,19 @@ semantic versioning once public model or data formats are declared stable.
   change policy) and a common-errors quick reference. Linked from `README.md`
   and `docs/README.md`.
 
+### Changed
+
+- Dataset downloads are pinned to a byte-stable snapshot on GitHub Releases
+  (tag `data-cwi-games-v1`): upstream re-published `games.tgz` on 2026-10-25
+  (new SHA-256 `9a7e4069…`, only +54 games under `games/people/Cho_Hunhyun/`,
+  beyond the ingest scan window — the 10k dataset identity is unaffected).
+  `cwi.py` downloads from the release asset and records the original CWI URL
+  as provenance only, so archive/dataset SHA-256 and checkpoint resume gates
+  stay unchanged (verified: a fresh download + re-ingest reproduces the
+  pinned dataset byte-identically). The snapshot is a data asset under the
+  source collection's public-domain terms, outside the repository's
+  LGPL-3.0-only license; see `THIRD_PARTY_NOTICES.md`.
+
 ## [0.5.0] - 2026-10-25
 
 ### Added

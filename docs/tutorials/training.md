@@ -51,7 +51,10 @@ CWI 棋谱归档 (games.tgz, SHA-256 钉死)
 #  "games_root": ".../.cache/cwi/games"}
 ```
 
-下载器把归档写到 `.cache/downloads/cwi-go-games.tgz`：先落
+下载源是项目 Releases 上的字节快照（tag `data-cwi-games-v1`）——2026-10-25
+上游 CWI 重新发布归档后固化，任何时间下载都得到同一字节，上游漂移不会
+再让校验失败；原始上游地址只作为 provenance 记录。下载器把归档写到
+`.cache/downloads/cwi-go-games.tgz`：先落
 `.tgz.part` 临时文件，**完整下载后才原子改名**；网络错误自动重试 4 次
 （指数退避）。文件就位后计算 SHA-256，与代码中钉死的
 `CWI_ARCHIVE_SHA256`（`python/go_pipeline/cwi.py`，同时记录在
@@ -92,7 +95,7 @@ rm -rf .cache/cwi
 
 # 4) 网络不稳时手动下载，交给管线做校验（文件已存在时管线只校验、不覆盖）
 curl -L --retry 5 -o .cache/downloads/cwi-go-games.tgz \
-  https://homepages.cwi.nl/~aeb/go/games/games.tgz
+  https://github.com/EthanPeng-2048/go.neuralnet.cpp/releases/download/data-cwi-games-v1/cwi-go-games.tgz
 .venv/bin/go-pipeline download
 ```
 
@@ -102,7 +105,7 @@ curl -L --retry 5 -o .cache/downloads/cwi-go-games.tgz \
 |---|---|---|
 | `sha256sum` 等于 `c57ad2b…` | 归档完好 | 继续 §3 |
 | `got` 每次都不同 | 传输持续被破坏（代理/运营商劫持、磁盘坏道） | 换网络或用上面第 4 步手动下载 |
-| `got` 每次相同但 ≠ 期望值 | **上游文件变了**，重新下载多少次都没用 | 见下"上游变了怎么办" |
+| `got` 每次相同但 ≠ 期望值 | 下载到的不是钉死资产（镜像/代理劫持/资产被误换） | 核对 `gh release view data-cwi-games-v1` 的资产哈希，换网络重下 |
 
 钉死的期望值（与
 [`DEPENDENCIES.md`](../../DEPENDENCIES.md) 一致）：
@@ -111,15 +114,18 @@ curl -L --retry 5 -o .cache/downloads/cwi-go-games.tgz \
 c57ad2ba3c5f3a3ee145bb77bcc9c0167c0d7b5478cf691a8939f750511071e2
 ```
 
-**上游变了怎么办**：这是数据源变更，不是本地故障。不要为了让校验通过去
-改 `cwi.py` 里的常量或绕过校验 —— 按项目规则，先核对上游页面与文件，
-再走依赖与数据验收的更新流程（更新
-[`DEPENDENCIES.md`](../../DEPENDENCIES.md)，并按
-[`M2/M3 报告`](../benchmarks/m2-m3-data.md) 的口径重新验收）。归档变化会
-连带下游身份变化：重入库的 `data/cwi-10k.nngames` SHA-256 会变（当前钉死值
-`bc4ea0c7929350395a0d632f53b2a59f270b6bb7510b3dcd5095c670e49d2313`），
-由此生成的 `.ngf` 训练缓存身份也变，**旧 checkpoint 不能再 `--resume`**
-（身份门禁会硬错，见 §6），需要从推理模型重开一轮训练。
+**上游变了怎么办**：`download` 现在钉死在项目 Releases 快照上，上游漂移
+**不再影响**新用户的下载。这个策略正是被真实事件固化的：2026-10-25
+上游重新发布 `games.tgz`（新哈希 `9a7e4069…`，仅在 `games/people/
+Cho_Hunhyun/` 下新增 54 局、无删除无修改；新增文件排序位置在入库扫描
+窗口 10,066 之外，1 万局数据集身份不受影响），项目随即把旧版字节快照到
+tag `data-cwi-games-v1` 并把下载点切过去 —— 归档/数据集 SHA-256 均未变，
+零重验收。仍然撞到 checksum 错就按上面步骤重下。想跟进上游新增棋谱
+属于数据集变更：需要新 tag、新 SHA-256，并按
+[`M2/M3 报告`](../benchmarks/m2-m3-data.md) 口径重新验收；归档变化会连带
+下游身份变化（`.nngames`、`.ngf` 的 SHA-256 都变），**旧 checkpoint 不能
+再 `--resume`**（身份门禁硬错，见 §6），需从推理模型重开一轮训练。
+Release 资产视为不可变：改动它会破坏所有已记录的身份。
 
 > 附加参数：`--archive PATH` 指定归档落点，`--destination PATH` 指定解压
 > 目录；不给时用上面的 `.cache/` 默认路径。

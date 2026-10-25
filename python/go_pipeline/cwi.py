@@ -16,7 +16,19 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from .model import SgfUnsupported
 from .sgf import parse_sgf
 
-CWI_URL = "https://homepages.cwi.nl/~aeb/go/games/games.tgz"
+# 下载地址钉死在项目 Releases 的字节快照（data-cwi-games-v1）。上游
+# homepages.cwi.nl 于 2026-10-25 重新发布过归档（新 SHA-256 9a7e4069…，
+# 仅新增 54 局 Cho Hunhyun 棋谱，在入库扫描窗口之外、不影响 1 万局数据集），
+# 为免上游漂移破坏既有验收与断点的数据身份，下载点固定为快照。
+# 快照是未改动的上游副本，作为数据资产分发：不属于源码树，不受本仓库
+# LGPL-3.0-only 覆盖，沿用源许可（CWI 声明的 public domain）。
+CWI_URL = (
+    "https://github.com/EthanPeng-2048/go.neuralnet.cpp/releases/download/"
+    "data-cwi-games-v1/cwi-go-games.tgz"
+)
+# 来源（provenance）：快照的原始上游地址。写入 pack 与 manifest 的身份字段
+# （改它会改变 .nngames 容器字节 ⇒ 数据集 SHA-256 变化），不用于下载。
+CWI_SOURCE_URL = "https://homepages.cwi.nl/~aeb/go/games/games.tgz"
 CWI_ARCHIVE_SHA256 = "c57ad2ba3c5f3a3ee145bb77bcc9c0167c0d7b5478cf691a8939f750511071e2"
 CWI_LICENSE = "CWI states that the games in this collection are in the public domain."
 CWI_METADATA_EPOCH = 1_792_800_000  # 2026-10-24T00:00:00Z
@@ -150,7 +162,7 @@ def build_cwi_dataset(
             "--source-name",
             "cwi-go-games",
             "--source-url",
-            CWI_URL,
+            CWI_SOURCE_URL,
             "--archive-sha256",
             archive_sha,
             "--license",
@@ -206,7 +218,7 @@ def build_cwi_dataset(
         "sizes_seen": {str(key): value for key, value in sorted(sizes.items())},
         "source": {
             "name": "cwi-go-games",
-            "url": CWI_URL,
+            "url": CWI_SOURCE_URL,
             "archive": str(archive),
             "archive_sha256": archive_sha,
             "license": CWI_LICENSE,
