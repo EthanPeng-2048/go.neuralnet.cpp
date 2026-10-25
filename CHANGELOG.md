@@ -4,6 +4,35 @@ All notable project changes are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning once public model or data formats are declared stable.
 
+## [0.5.0] - 2026-10-25
+
+### Added
+
+- `go::MctsSearch` (M8): a PUCT tree-search engine (search-only per D9) in
+  front of any policy model. Priors and leaf evaluation go through the
+  `go::LeafEvaluator` interface, so both model lines drive the same tree: the
+  B encoder supplies its masked-softmax priors plus the value head, while the
+  C validator (no value head) falls back to `ValueFallback::area_score`
+  leaves. Priors are renormalized over KataGo's legal-move set only, the
+  negamax backup stores edge values in the parent player's view, terminal
+  positions back up KataGo's score, and the transposition table caches
+  evaluations under a key covering the whole evaluator input (board, side to
+  move, simple ko, last-64-move window).
+- `mcts:VISITS:model:FILE[=DEVICE]` engine spec for `go_arena_cli` and the
+  GUI, plus `go_gtp_cli --visits N` for the Sabaki path (`--visits 0` keeps
+  the M6 raw-policy-argmax behaviour and is the default).
+- `tests/go_mcts_tests.cpp` (tree contracts: PUCT selection, prior
+  renormalization, legality under adversarial priors, negamax sign, terminal
+  scoring, transposition-table reuse) and `tests/test_m8_mcts.py` (GTP
+  `--visits` wiring, arena engine spec, malformed-spec rejection).
+- `docs/benchmarks/m8-mcts.md`: M8 acceptance record (search vs raw-prior
+  gain, move latency, scope notes).
+
+### Changed
+
+- `go_gui_cli` attaches the `--device` suffix to `mcts:` engine specs as well
+  as `model:` specs, and auto-discovery prefers `.cache/m8-b-bench.nnmodel`.
+
 ## [0.4.0] - 2026-10-25
 
 ### Added

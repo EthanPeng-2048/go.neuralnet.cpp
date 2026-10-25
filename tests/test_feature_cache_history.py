@@ -22,6 +22,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from dataclasses import replace
+
 from go_pipeline.model import GameRecord, decode_move, encode_move
 from go_pipeline.tokenizer import PAD, PASS, VOCAB_SIZE
 from go_pipeline.training import write_feature_cache
@@ -120,6 +122,34 @@ def read_cache_history(path: Path, history_len: int) -> list[list[int]]:
         offset = 56 + index * stride + 24
         out.append(list(struct.unpack_from(f"<{history_len}H", data, offset)))
     return out
+
+
+class FeatureCacheSkipTests(unittest.TestCase):
+    """数据边界：颜色不交替的棋谱跳过并记账，其余照常缓存。"""
+
+    def test_non_alternating_game_is_skipped(self) -> None:
+        good = make_records(count=1, moves_per_game=6)[0][1]
+        bad_moves = list(good.moves)
+        # 第 3 手改成与第 2 手同色（重放 to_move 必然对不上）。
+        bad_moves[3] = encode_move("b", (6, 6))
+        bad = replace(good, id="cache-history-bad", moves=tuple(bad_moves))
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "skipped.ngf"
+            result = write_feature_cache(
+                cache, split="train",
+                records=[(0, good), (1, bad)],
+                rules_cli=RULES_CLI, history_len=TINY_K,
+            )
+            self.assertEqual(result.games, 1)
+            self.assertEqual(result.records, len(good.moves))
+            self.assertEqual(
+                [entry.game for entry in result.skipped], ["cache-history-bad"]
+            )
+            self.assertIn("color disagrees", result.skipped[0].reason)
+            decoded = read_cache_history(cache, TINY_K)
+            self.assertEqual(len(decoded), len(good.moves))
+            self.assertEqual(result.to_json()["skipped"][0]["game"], "cache-history-bad")
 
 
 class FeatureCacheHistoryTests(unittest.TestCase):

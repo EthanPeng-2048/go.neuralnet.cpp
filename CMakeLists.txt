@@ -140,8 +140,15 @@ endif()
 add_library(go_policy STATIC src/go/policy.cpp)
 target_link_libraries(go_policy PUBLIC go_rules go_katago_game go_model neuralnet::nn)
 
+# M8: MCTS inference engine (PUCT / prior normalization / legality /
+# transposition table), search-only per D9. Model-agnostic: priors and leaf
+# values come in through go::LeafEvaluator; the product line plugs in
+# PolicyPlayer via make_policy_evaluator.
+add_library(go_mcts STATIC src/go/mcts.cpp)
+target_link_libraries(go_mcts PUBLIC go_policy)
+
 add_executable(go_gtp_cli src/go/go_gtp_cli.cpp)
-target_link_libraries(go_gtp_cli PRIVATE go_policy)
+target_link_libraries(go_gtp_cli PRIVATE go_policy go_mcts)
 if(WIN32)
     target_link_options(go_gtp_cli PRIVATE "LINKER:/STACK:8388608")
 endif()
@@ -165,7 +172,7 @@ endif()
 # GUI: 对局引擎抽象（random / model / 外部 GTP 子进程）抽出共用，
 # go_arena_cli 的批量评估与 GUI 竞技台走同一实现。
 add_library(go_arena_engine STATIC src/go/arena_engine.cpp)
-target_link_libraries(go_arena_engine PUBLIC go_policy)
+target_link_libraries(go_arena_engine PUBLIC go_policy go_mcts)
 
 # GUI: 会话状态机（对弈 + 竞技台）+ 极简 HTTP 服务器 + 内嵌单页前端。
 # 规则固定中国规则（go::RuleSet::chinese），选点走 go::PolicyPlayer。
@@ -223,6 +230,13 @@ if(BUILD_TESTING)
     target_link_libraries(go_model_tests PRIVATE go_model)
     add_test(NAME go_model_m7_tests COMMAND go_model_tests)
     set_tests_properties(go_model_m7_tests PROPERTIES TIMEOUT 120)
+
+    # M8: MCTS engine contracts (PUCT selection / prior renormalization /
+    # legality / transposition table / terminal scoring).
+    add_executable(go_mcts_tests tests/go_mcts_tests.cpp)
+    target_link_libraries(go_mcts_tests PRIVATE go_mcts)
+    add_test(NAME go_mcts_m8_tests COMMAND go_mcts_tests)
+    set_tests_properties(go_mcts_m8_tests PROPERTIES TIMEOUT 120)
 
     # GUI: 会话状态机单测（对弈流程、悔棋、竞技台步进与换先、SGF、状态 JSON）。
     add_executable(go_gui_tests tests/go_gui_tests.cpp)
@@ -314,6 +328,17 @@ if(BUILD_TESTING)
         set_tests_properties(go_model_m7_python PROPERTIES
             TIMEOUT 600
             ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_train_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+        # M8: the MCTS engine behind the GTP (--visits) and arena
+        # (mcts:VISITS:model:...) front ends. Tree semantics live in
+        # go_mcts_tests; this covers the product wiring.
+        add_test(
+            NAME go_mcts_m8_python
+            COMMAND "${GO_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_m8_mcts.py"
+        )
+        set_tests_properties(go_mcts_m8_python PROPERTIES
+            TIMEOUT 600
+            ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_gtp_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
         )
         # GUI: 起一个真实 go_gui_cli，走 HTTP 全流程（页面、对弈、引擎应手、
         # 悔棋、竞技台自动对局、SGF、评估接口）。

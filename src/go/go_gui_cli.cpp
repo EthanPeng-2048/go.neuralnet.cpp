@@ -46,15 +46,20 @@ struct Options {
 };
 
 std::string with_device(const std::string& spec, const std::string& device) {
-    if (device.empty() || !spec.starts_with("model:")) {
+    if (device.empty() || spec.find('=') != std::string::npos) {
         return spec;
     }
-    return spec + "=" + device;
+    // model:FILE 与 mcts:VISITS:model:FILE 都把设备后缀挂在最外层尾部
+    // （make_engine 对内层 model: 段做 split('=')）。
+    const bool model_spec = spec.starts_with("model:") ||
+        (spec.starts_with("mcts:") && spec.find(":model:") != std::string::npos);
+    return model_spec ? spec + "=" + device : spec;
 }
 
 // 没给 --engine 时在常见产物位置找模型；找不到就用 random（照样能下棋）。
 std::string discover_model_spec() {
     constexpr std::string_view candidates[] = {
+        ".cache/m8-b-bench.nnmodel",
         "artifacts/m4/m4-c-validator.nnmodel",
         ".cache/m7-b-smoke.nnmodel",
         ".cache/m7-c-base.nnmodel",

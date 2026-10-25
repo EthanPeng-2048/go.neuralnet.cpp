@@ -32,6 +32,17 @@ DEFAULT_HISTORY_LEN = 64
 
 
 @dataclass(frozen=True, slots=True)
+class SkippedGame:
+    """一局被跳过的棋谱 + 原因（数据边界，如重放颜色不一致）。"""
+
+    game: str
+    reason: str
+
+    def to_json(self) -> dict[str, str]:
+        return {"game": self.game, "reason": self.reason}
+
+
+@dataclass(frozen=True, slots=True)
 class CacheBuildResult:
     path: Path
     split: str
@@ -39,6 +50,7 @@ class CacheBuildResult:
     records: int
     bytes: int
     sha256: str
+    skipped: tuple[SkippedGame, ...] = ()
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -48,6 +60,7 @@ class CacheBuildResult:
             "records": self.records,
             "bytes": self.bytes,
             "sha256": self.sha256,
+            "skipped": [entry.to_json() for entry in self.skipped],
         }
 
 
@@ -206,6 +219,7 @@ def write_feature_cache(
         history_len,
         VOCAB_SIZE,
     )
+    skipped: list[SkippedGame] = []
     with temporary.open("wb") as stream:
         stream.write(header)
         sample_id = 0
@@ -213,6 +227,19 @@ def write_feature_cache(
             chunk = records[chunk_start : chunk_start + 32]
             traces = trace_records([record for _, record in chunk], rules_cli)
             for (game_index, record), trace in zip(chunk, traces, strict=True):
+                try:
+                    game_samples = _samples_for_game(
+                        record,
+                        trace,
+                        first_sample_id=sample_id,
+                        game_index=game_index,
+                        history_len=history_len,
+                    )
+                except ValueError as error:
+                    # 数据边界（如重放颜色不一致的棋谱）：跳过整局并记入
+                    # manifest，不为一局脏数据废掉整个缓存构建。
+                    skipped.append(SkippedGame(game=record.id, reason=str(error)))
+                    continue
                 for (
                     current_id,
                     current_game,
@@ -221,13 +248,7 @@ def write_feature_cache(
                     value,
                     planes,
                     history,
-                ) in _samples_for_game(
-                    record,
-                    trace,
-                    first_sample_id=sample_id,
-                    game_index=game_index,
-                    history_len=history_len,
-                ):
+                ) in game_samples:
                     if planes.shape != (FEATURE_COUNT,):
                         raise ValueError(f"{record.id}: invalid cached feature shape")
                     if history.shape != (history_len,):
@@ -245,14 +266,32 @@ def write_feature_cache(
                     stream.write(history.tobytes(order="C"))
                     stream.write(planes.astype("<f4", copy=False).tobytes(order="C"))
                     sample_id += 1
+        if sample_id == 0:
+            raise ValueError(f"{split}: no samples generated")
+        if skipped:
+            # 跳过整局改变了样本总数：回头修正文件头部的记录数。
+            stream.seek(0)
+            stream.write(
+                CACHE_HEADER.pack(
+                    CACHE_MAGIC,
+                    CACHE_VERSION,
+                    CACHE_HEADER_SIZE,
+                    sample_id,
+                    FEATURE_COUNT,
+                    BOARD_SIZE,
+                    history_len,
+                    VOCAB_SIZE,
+                )
+            )
     temporary.replace(output)
     return CacheBuildResult(
         path=output,
         split=split,
-        games=len(records),
-        records=record_count,
+        games=len(records) - len(skipped),
+        records=sample_id,
         bytes=output.stat().st_size,
         sha256=_sha256_file(output),
+        skipped=tuple(skipped),
     )
 
 

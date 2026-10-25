@@ -6,6 +6,8 @@
 //   * random  —— 均匀随机合法着（不主动 pass；无子可下才 pass）。
 //   * model:FILE[=DEVICE] —— 本项目的策略模型（go::PolicyPlayer）。
 //   * gtp:COMMAND —— 外部 GTP 引擎子进程（如 `gnugo --mode gtp --quiet`）。
+//   * mcts:VISITS:model:FILE[=DEVICE] —— M8：MCTS 搜索（visits 次模拟）包装
+//     策略模型；先验/叶子评估与 model: 引擎同源，C/B 模型都能驱动。
 
 #include <charconv>
 #include <cctype>
@@ -23,7 +25,8 @@
 #include <vector>
 
 #include "go/arena_engine.hpp"
-#include "go/features.hpp"  // feature_plane_stride / policy_class_count
+#include "go/features.hpp"
+#include "go/mcts.hpp"  // feature_plane_stride / policy_class_count
 
 #if defined(_WIN32)
 #include <fcntl.h>   // _O_TEXT（_fdopen 的翻译模式）
@@ -452,6 +455,97 @@ private:
     pid_t pid_ = -1;
 #endif
 };
+
+// model spec 尾段解析：FILE[=DEVICE] → (FILE, DEVICE)；"cpu" 等价于空。
+std::pair<std::string, std::string> split_model_path(std::string rest) {
+    std::string device;
+    if (const std::size_t equals = rest.find('='); equals != std::string::npos) {
+        device = rest.substr(equals + 1);
+        rest.resize(equals);
+    }
+    if (device == "cpu") {
+        device.clear();
+    }
+    return {std::move(rest), std::move(device)};
+}
+
+// ── M8：MCTS 引擎 ────────────────────────────────────────────────────────
+// 搜索包装策略模型：先验 = 模型合法着分布，叶子评估 = 价值头（C 没有价值头
+// 时走面积计分回退）。预告与实战同源：preview_move 搜一次记住，genmove 在
+// 同一局面直接下它（AI 视角显示的点 = 实战的点）。
+class MctsEngine final : public ArenaEngine {
+public:
+    MctsEngine(std::size_t visits, std::string path, std::string device)
+        : visits_(visits),
+          path_(std::move(path)),
+          device_(std::move(device)) {}
+
+    std::optional<go::Point> genmove(go::Game& game) override {
+        if (planned_.has_value() && planned_for_ == game.to_move() &&
+            planned_at_ == game.move_count()) {
+            const std::optional<go::Point> move = *planned_;
+            planned_.reset();
+            return move;
+        }
+        planned_.reset();
+        return run_search(game).best_move;
+    }
+
+    [[nodiscard]] std::optional<std::optional<go::Point>> preview_move(
+        const go::Game& game) override {
+        if (!planned_.has_value() || planned_for_ != game.to_move() ||
+            planned_at_ != game.move_count()) {
+            planned_ = run_search(game).best_move;
+            planned_for_ = game.to_move();
+            planned_at_ = game.move_count();
+        }
+        return planned_;
+    }
+
+    void clear_board(int, float) override { planned_.reset(); }
+
+    void notify_move(go::Stone, const std::optional<go::Point>&) override {
+        planned_.reset();
+    }
+
+    // 评估口径：直接给模型原始先验 + 价值头（便宜，GUI 热力图用）。
+    // 搜索的访问分布经 preview_move / genmove 体现，不重复烧 visits。
+    [[nodiscard]] std::optional<PolicyEvaluation> evaluate(const Game& game) override {
+        ensure_ready();
+        return player_->evaluate(game);
+    }
+
+    [[nodiscard]] std::string name() const override {
+        return "mcts:" + std::to_string(visits_) + ":model:" + path_;
+    }
+
+private:
+    void ensure_ready() {
+        if (!player_) {
+            player_ = go::PolicyPlayer::load(path_, device_);
+            evaluator_ = go::make_policy_evaluator(*player_);
+            go::MctsConfig config;
+            config.simulations = visits_;
+            search_ = std::make_unique<go::MctsSearch>(*evaluator_, config);
+        }
+    }
+
+    go::MctsResult run_search(const go::Game& game) {
+        ensure_ready();
+        return search_->search(game);
+    }
+
+    std::size_t visits_;
+    std::string path_;
+    std::string device_;
+    std::optional<go::PolicyPlayer> player_;
+    std::unique_ptr<go::LeafEvaluator> evaluator_;
+    std::unique_ptr<go::MctsSearch> search_;
+    std::optional<std::optional<go::Point>> planned_;  // 已预告未下的一步
+    go::Stone planned_for_ = go::Stone::black;
+    std::size_t planned_at_ = 0;
+};
+
 }  // namespace
 
 std::optional<std::optional<Point>> ArenaEngine::preview_move(const Game&) {
@@ -485,23 +579,39 @@ std::unique_ptr<ArenaEngine> make_engine(const std::string& spec, std::uint64_t 
         return std::make_unique<RandomEngine>(seed);
     }
     if (spec.starts_with("model:")) {
-        std::string rest = spec.substr(6);
-        std::string device;
-        if (const std::size_t equals = rest.find('='); equals != std::string::npos) {
-            device = rest.substr(equals + 1);
-            rest.resize(equals);
+        auto [path, device] = split_model_path(spec.substr(6));
+        return std::make_unique<ModelEngine>(std::move(path), std::move(device));
+    }
+    if (spec.starts_with("mcts:")) {
+        const std::string rest = spec.substr(5);
+        const std::size_t colon = rest.find(':');
+        std::size_t visits = 0;
+        const std::string number = rest.substr(0, colon);
+        const auto [end, error] = std::from_chars(
+            number.data(), number.data() + number.size(), visits);
+        if (colon == std::string::npos || error != std::errc{} ||
+            end != number.data() + number.size() || visits == 0) {
+            throw std::invalid_argument(
+                "mcts engine spec must be mcts:VISITS:model:FILE[=DEVICE]: " + spec
+            );
         }
-        if (device == "cpu") {
-            device.clear();
+        const std::string inner = rest.substr(colon + 1);
+        if (!inner.starts_with("model:")) {
+            throw std::invalid_argument(
+                "mcts engine wraps model:FILE[=DEVICE] only: " + spec
+            );
         }
-        return std::make_unique<ModelEngine>(rest, device);
+        auto [path, device] = split_model_path(inner.substr(6));
+        return std::make_unique<MctsEngine>(
+            visits, std::move(path), std::move(device));
     }
     if (spec.starts_with("gtp:")) {
         return std::make_unique<GtpProcessEngine>(spec.substr(4));
     }
     throw std::invalid_argument(
         "unknown engine spec: " + spec +
-        " (expected random | model:FILE[=DEVICE] | gtp:COMMAND)"
+        " (expected random | model:FILE[=DEVICE] |"
+        " mcts:VISITS:model:FILE[=DEVICE] | gtp:COMMAND)"
     );
 }
 
@@ -509,6 +619,17 @@ std::unique_ptr<ArenaEngine> make_engine(const std::string& spec, std::uint64_t 
 std::string engine_display_name(const std::string& spec) {
     if (spec == "random") {
         return "随机引擎";
+    }
+    if (spec.starts_with("mcts:")) {
+        const std::string_view rest = std::string_view{spec}.substr(5);
+        const std::size_t colon = rest.find(':');
+        const std::size_t model = rest.find(
+            "model:", colon == std::string_view::npos ? 0 : colon + 1);
+        if (colon != std::string_view::npos && model != std::string_view::npos) {
+            return engine_display_name(std::string{rest.substr(model)}) +
+                   "·MCTS×" + std::string(rest.substr(0, colon));
+        }
+        return spec;
     }
     if (spec.starts_with("model:")) {
         std::string rest = spec.substr(6);

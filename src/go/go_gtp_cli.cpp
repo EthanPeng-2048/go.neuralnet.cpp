@@ -8,15 +8,17 @@
 //     list_commands / boardsize / clear_board / komi / play / genmove /
 //     showboard / final_score / quit；
 //   * 规则全部走 KataGo（go::Game），与 M1/M2/M6 特征同源；
-//   * genmove：M3 v1 特征 → 策略模型 → 合法点 argmax（go::PolicyPlayer）。
+//   * genmove：M3 v1 特征 → 策略模型 → 合法点 argmax（go::PolicyPlayer）；
+//     `--visits N` 打开 M8 的 MCTS 搜索（N 次模拟）。
 //
-// 不实现：reg_genmove / ponder / time settings（本项目 M8 之前无搜索，
-// time 命令只做应答不生效）。boardsize 支持 1–19，但**模型只在 19×19 上
+// 不实现：reg_genmove / ponder / time settings（time 命令只做应答不生效）。boardsize 支持 1–19，但**模型只在 19×19 上
 // 可用**：其他尺寸的 genmove 返回错误并提示（特征契约限制，不是协议限制）。
 
 #include <charconv>
 #include <cctype>
+#include <cstddef>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -25,6 +27,7 @@
 #include <vector>
 
 #include "go/game.hpp"
+#include "go/mcts.hpp"
 #include "go/policy.hpp"
 
 namespace {
@@ -35,6 +38,7 @@ constexpr const char* kEngineVersion = "0.2.0";
 struct GtpOptions {
     std::string model;
     std::string device;  // 空 = CPU
+    std::size_t visits = 0;  // >0 = M8 MCTS 搜索次数；0 = 纯先验 argmax
 };
 
 // GTP 坐标：字母 = 列（跳过 I），数字 = 行（自底向上，19 = 顶行）。
@@ -289,8 +293,17 @@ private:
         }
         if (!player_) {
             player_ = go::PolicyPlayer::load(options_.model, options_.device);
+            if (options_.visits > 0) {
+                evaluator_ = go::make_policy_evaluator(*player_);
+                go::MctsConfig config;
+                config.simulations = options_.visits;
+                search_ = std::make_unique<go::MctsSearch>(*evaluator_, config);
+            }
         }
-        const std::optional<go::Point> move = player_->select_move(game_);
+        // --visits N：MCTS 选点；缺省仍是纯先验 argmax（M6 语义不变）。
+        const std::optional<go::Point> move = search_
+            ? search_->search(game_).best_move
+            : player_->select_move(game_);
         if (!move.has_value()) {
             if (!game_.play(color, std::nullopt)) {
                 return {false, "cannot pass"};
@@ -330,12 +343,28 @@ private:
     float komi_ = 7.5F;
     go::Game game_;
     std::optional<go::PolicyPlayer> player_;
+    std::unique_ptr<go::LeafEvaluator> evaluator_;
+    std::unique_ptr<go::MctsSearch> search_;
 };
 
 void usage(const char* program) {
     std::cerr
-        << "usage: " << program << " --model FILE.nnmodel [--gpu[=DEVICE]]\n"
-        << "       GTP v2 over stdin/stdout (Sabaki-compatible)\n";
+        << "usage: " << program
+        << " --model FILE.nnmodel [--gpu[=DEVICE]] [--visits N]\n"
+        << "       GTP v2 over stdin/stdout (Sabaki-compatible)\n"
+        << "       --visits N: select moves with MCTS (N simulations);\n"
+        << "       N=0 (default) selects raw policy argmax\n";
+}
+
+std::size_t parse_visits(std::string_view text) {
+    std::size_t visits = 0;
+    const auto [end, error] =
+        std::from_chars(text.data(), text.data() + text.size(), visits);
+    // 0 = 纯先验 argmax（与缺省一致）；只拒绝非数字。
+    if (error != std::errc{} || end != text.data() + text.size()) {
+        throw std::invalid_argument("--visits must be a non-negative integer");
+    }
+    return visits;
 }
 
 GtpOptions parse_options(int argc, char** argv) {
@@ -355,6 +384,13 @@ GtpOptions parse_options(int argc, char** argv) {
             options.device = std::string(arg.substr(6));
         } else if (arg == "--cpu") {
             options.device.clear();
+        } else if (arg == "--visits") {
+            if (++i >= argc) {
+                throw std::invalid_argument("--visits requires a number");
+            }
+            options.visits = parse_visits(argv[i]);
+        } else if (arg.starts_with("--visits=")) {
+            options.visits = parse_visits(std::string(arg.substr(9)));
         } else if (arg == "--help" || arg == "-h") {
             usage(argv[0]);
             std::exit(0);
