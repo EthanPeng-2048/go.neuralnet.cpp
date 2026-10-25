@@ -4,7 +4,7 @@
 19×19 围棋训练与推理项目。模型、训练与 checkpoint 统一使用 neuralnet.cpp；
 棋规、SGF 和数据工程分别复用 KataGo、sgfmill 与 Python 生态。
 
-**当前状态：M0–M6 完成；M7 的 B 架构已落地（存盘/续训无损、推理 1312 pos/s 达标），但"同数据下 B 显著优于 C"未达成 —— 逐档数据与诊断见 [M7 验收](docs/benchmarks/m7-b-vs-c.md)。**
+**当前状态：M0–M7 + GUI 完成；M8 的 MCTS 引擎已落地（契约单测 + Arena/GTP/GUI 链路 + 40HX GPU 实测 126 visits/s），增益验收与大数据训练进行中 —— 见 [M7 验收](docs/benchmarks/m7-b-vs-c.md) 与 [M8 验收](docs/benchmarks/m8-mcts.md)。**
 
 | 里程碑 | 状态 | 产物 |
 |---|---|---|
@@ -15,6 +15,9 @@
 | M4 验证器竖切 | ✅ | 规则 → 特征 → C 模型训练 → 存取 → 评估 |
 | M5 GoTrainer | ✅ | `--resume` 逐位无损续训、指标 JSONL、双角色存取 |
 | M6 GTP + Arena | ✅ | Sabaki 可下的 GTP 适配器、Arena + SPRT 自动评估 |
+| M7 B 架构 | ✅* | GoModel 复合层 + GoLoss 双头、存盘/续训无损、1312 pos/s（*"显著优于 C"留待大数据训练，见 [M7 验收](docs/benchmarks/m7-b-vs-c.md)） |
+| GUI 对弈室 | ✅ | 浏览器对弈 + 竞技台，中国规则，候选着热力图/价值头 |
+| M8 MCTS 引擎 | ✅* | PUCT/先验归一/合法性/转置表，`mcts:N:model:` 引擎 + GTP `--visits`，C/B 双线可用（*增益验收数据见 [M8 验收](docs/benchmarks/m8-mcts.md)） |
 
 路线图与设计决策见 [`docs/design/00-roadmap.md`](docs/design/00-roadmap.md)，
 全部文档入口见 [`docs/README.md`](docs/README.md)，第三方版本唯一真源见

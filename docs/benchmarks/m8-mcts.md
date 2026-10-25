@@ -88,7 +88,22 @@ Two things fall out of this table:
    40HX, and batch-1 search traffic behaves differently. 40HX batch-1 numbers
    land here once the Vulkan build completes.
 
-<!-- FILLED: 40HX GPU batch-1 visits/s -->
+40HX GPU (Vulkan, `go_gtp_cli.exe --gpu=40HX`, warmup moves discarded,
+median of 18 timed genmoves, batch 1):
+
+| selection | ms/move | visits/s |
+|---|---|---|
+| pure prior | 10.6 | — (1 eval) |
+| mcts-32 | 300 | 107 |
+| mcts-128 | 1019 | **126** |
+
+The 40HX runs the B encoder at ~8 ms per batch-1 evaluation vs ~77 ms on the
+dev CPU: **126 visits/s vs 13 visits/s**. At the bet-terms range of 40–100
+visits that is 0.3–0.8 s per move, comfortably inside a playable clock. Note
+the §7 budget (915/578 pos/s) was estimated at batch 64; search traffic is
+batch 1, so the two are not directly comparable — the M7 inference gate
+(1312 pos/s at batch 32 on the 40HX) stays the throughput acceptance, and
+this table is the search-side latency record.
 
 ## Gain (arena, 19×19, Chinese rules)
 
