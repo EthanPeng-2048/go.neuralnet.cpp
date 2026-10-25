@@ -4,6 +4,17 @@ All notable project changes are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning once public model or data formats are declared stable.
 
+## [Unreleased]
+
+### Added
+
+- `docs/tutorials/training.md`: end-to-end training tutorial (dataset download
+  and SHA-256 verification, `.nngames` ingest, `.ngf` caches, B-model training,
+  resume gates, evaluation), including the recovery procedure for an archive
+  checksum mismatch (`go-pipeline download --refresh`, cache cleanup, upstream
+  change policy) and a common-errors quick reference. Linked from `README.md`
+  and `docs/README.md`.
+
 ## [0.5.0] - 2026-10-25
 
 ### Added

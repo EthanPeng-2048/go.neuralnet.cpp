@@ -107,7 +107,39 @@ this table is the search-side latency record.
 
 ## Gain (arena, 19×19, Chinese rules)
 
-<!-- FILLED: arena result -->
+Arena pairings on the 40HX GPU (Vulkan), komi 7.5, seed 20261025, colour
+alternating per game. Player and opponent load the **same**
+`.cache/m8-b-bench.nnmodel`; the only difference is move selection.
+
+### Search vs raw prior (the DoD pairing)
+
+| player | opponent | result | game lengths (moves) | wall time |
+|---|---|---|---|---|
+| `mcts:128:model:…` | `model:…` (raw prior argmax) | **6 – 0** | 512 / 452 / 516 / 452 / 516 / 452 | 1341 s |
+
+Raw report: `.cache/m8-b-gpu-vs-prior.json` (copied from
+`D:\Codes\m8-b-gpu-vs-prior.json`). Win rate 1.0 — 128-visit search beats
+raw-prior play with the same net in every game, on both colours. This is the
+M8 DoD's "search vs pure prior" evidence.
+
+### vs GnuGo (context, not a DoD pass)
+
+| player | opponent | result | game lengths (moves) | wall time |
+|---|---|---|---|---|
+| `mcts:128:model:…` | `gtp:wsl gnugo --mode gtp --quiet --level 1` | **0 – 4** | 415 / 490 / 427 / 428 | 1286 s |
+
+Raw report: `.cache/m8-b-gpu-vs-gnugo.json`. The B encoder used here was
+trained on **30 games** (6.4k samples) and overfits hard (2% top-1); losing to
+GnuGo level 1 says the *model* is far below playable strength, not that the
+search loop failed — the same loop just went 6-0 against the same model
+without search. The data-scale retrain (3,000 games / 624k samples) is the
+lever for this row; see the M7 record for why data volume is the binding
+constraint.
+
+### C line (already recorded above)
+
+C+MCTS loses to GnuGo at every visits level tried (0-4, 0-4, 0-4) because C
+has no value head — see the C-line section for the full table and diagnosis.
 
 ## Scope notes (honest)
 

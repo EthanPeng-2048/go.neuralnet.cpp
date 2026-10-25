@@ -8,6 +8,7 @@ with the dependency baseline before changing a third-party component.
 
 | Document | Purpose |
 |---|---|
+| [Training tutorial](tutorials/training.md) | End-to-end training walkthrough: dataset download, SHA-256 re-download recovery, caches, training, resume, evaluation |
 | [Roadmap and decisions](design/00-roadmap.md) | Scope, decisions, milestones, budgets, and open questions |
 | [Third-party selection](design/07-third-party-selection.md) | Responsibilities and boundaries of KataGo, neuralnet.cpp, and Python tools |
 | [Data and feature format](design/08-data-and-features.md) | `.nngames`, GoTokenizer, `.nnvocab`, and feature-plane contracts |

@@ -19,8 +19,10 @@
 | GUI 对弈室 | ✅ | 浏览器对弈 + 竞技台，中国规则，候选着热力图/价值头 |
 | M8 MCTS 引擎 | ✅* | PUCT/先验归一/合法性/转置表，`mcts:N:model:` 引擎 + GTP `--visits`，C/B 双线可用（*增益验收数据见 [M8 验收](docs/benchmarks/m8-mcts.md)） |
 
-路线图与设计决策见 [`docs/design/00-roadmap.md`](docs/design/00-roadmap.md)，
-全部文档入口见 [`docs/README.md`](docs/README.md)，第三方版本唯一真源见
+从零跑通一遍训练链路（含数据集 SHA-256 校验失败后的重新下载处理）见
+[`训练教程`](docs/tutorials/training.md)。路线图与设计决策见
+[`docs/design/00-roadmap.md`](docs/design/00-roadmap.md)，全部文档入口见
+[`docs/README.md`](docs/README.md)，第三方版本唯一真源见
 [`DEPENDENCIES.md`](DEPENDENCIES.md)。
 
 ## 快速开始
