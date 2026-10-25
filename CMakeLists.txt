@@ -7,9 +7,19 @@ project(go_neuralnet
     LANGUAGES CXX
 )
 
-set(CMAKE_CXX_STANDARD 26)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+# C++26. CMake 4.x has no CXX26 dialect flag for MSVC (cl 19.51 routes C++26
+# features through /std:c++latest), so mirror the library's own split: MSVC gets
+# the C++23 dialect plus an explicit /std:c++latest, everyone else gets C++26.
+if(MSVC)
+    set(CMAKE_CXX_STANDARD 23)
+    set(CMAKE_CXX_STANDARD_REQUIRED OFF)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+    add_compile_options(/std:c++latest)
+else()
+    set(CMAKE_CXX_STANDARD 26)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -77,7 +87,7 @@ set_target_properties(go_katago_game PROPERTIES
 )
 unset(_go_katago_root)
 
-add_library(go_rules STATIC src/go/game.cpp)
+add_library(go_rules STATIC src/go/game.cpp src/go/features.cpp)
 target_include_directories(go_rules PUBLIC include)
 target_link_libraries(go_rules PRIVATE go_katago_game)
 
@@ -93,16 +103,63 @@ target_link_libraries(go_data_cli PRIVATE go_nngames go_katago_game neuralnet::n
 add_library(go_feature_cache STATIC src/go/feature_cache.cpp)
 target_include_directories(go_feature_cache PUBLIC include)
 
+# M7: the B architecture (dual-branch encoder + decision query + policy/value
+# heads) in its own library so trainer and policy player share one model
+# factory/spec dispatch. Element-wise math is written with dsl::compute; on GPU
+# builds each executable additionally compiles the model TU into its own
+# AOT fusion collector (see nn_enable_gpu_fusion below).
+add_library(go_model STATIC src/go/go_model.cpp)
+target_include_directories(go_model PUBLIC include)
+target_link_libraries(go_model PUBLIC neuralnet::nn go_feature_cache)
+
 add_executable(go_train_cli src/go/go_train_cli.cpp)
 target_link_libraries(
     go_train_cli
-    PRIVATE go_feature_cache go_katago_game neuralnet::nn
+    PRIVATE go_model go_feature_cache go_katago_game neuralnet::nn
 )
 if(WIN32)
     # neuralnet.cpp's streaming SHA-256 uses a 1 MiB stack buffer. The Windows
     # default executable stack is also about 1 MiB, so model integrity checks
     # overflow before the loader can read the first parameter.
     target_link_options(go_train_cli PRIVATE "LINKER:/STACK:8388608")
+endif()
+
+# M7: AOT fusion registration (neuralnet.cpp 的库外使用者标准做法）。
+# `nn_enable_gpu_fusion` 只为 Vulkan 构建定义；它把**目标自己的 SOURCES**
+# 减去 MAIN 后以 -DNN_EXPR_SCAN 编进收集器，GoModel 里每个 dsl::compute 的
+# FusedAnchor 在静态初始化期自登记。模型 TU 因此必须出现在目标的源文件
+# 列表里（它同时也在 go_model 静态库里——链接器不会重复取归档成员）。
+if(TARGET compile_gpu_shaders)
+    target_sources(go_train_cli PRIVATE src/go/go_model.cpp)
+    nn_enable_gpu_fusion(go_train_cli MAIN src/go/go_train_cli.cpp)
+endif()
+
+# M6: the policy player wires a loaded strategy model to KataGo rules
+# (features -> forward -> argmax over legal points). The GTP adapter and the
+# arena both build on it so their move selection is identical by construction.
+add_library(go_policy STATIC src/go/policy.cpp)
+target_link_libraries(go_policy PUBLIC go_rules go_katago_game go_model neuralnet::nn)
+
+add_executable(go_gtp_cli src/go/go_gtp_cli.cpp)
+target_link_libraries(go_gtp_cli PRIVATE go_policy)
+if(WIN32)
+    target_link_options(go_gtp_cli PRIVATE "LINKER:/STACK:8388608")
+endif()
+
+# M6: the arena plays batches of games between two engines (random / model /
+# external GTP subprocess) and applies an SPRT win-rate test to the player.
+add_executable(go_arena_cli src/go/go_arena_cli.cpp)
+target_link_libraries(go_arena_cli PRIVATE go_policy)
+if(WIN32)
+    target_link_options(go_arena_cli PRIVATE "LINKER:/STACK:8388608")
+endif()
+
+# 推理侧同样需要模型 TU 进各自目标的融合收集器。
+if(TARGET compile_gpu_shaders)
+    target_sources(go_gtp_cli PRIVATE src/go/go_model.cpp)
+    nn_enable_gpu_fusion(go_gtp_cli MAIN src/go/go_gtp_cli.cpp)
+    target_sources(go_arena_cli PRIVATE src/go/go_model.cpp)
+    nn_enable_gpu_fusion(go_arena_cli MAIN src/go/go_arena_cli.cpp)
 endif()
 
 include(CTest)
@@ -121,6 +178,12 @@ if(BUILD_TESTING)
     target_link_libraries(go_rules_tests PRIVATE go_rules)
     add_test(NAME go_rules_m1_tests COMMAND go_rules_tests)
     set_tests_properties(go_rules_m1_tests PROPERTIES TIMEOUT 30)
+
+    # M7: GoModel 契约（常量 / ModelSpec 往返 / tiny forward-backward / GoLoss）。
+    add_executable(go_model_tests tests/go_model_tests.cpp)
+    target_link_libraries(go_model_tests PRIVATE go_model)
+    add_test(NAME go_model_m7_tests COMMAND go_model_tests)
+    set_tests_properties(go_model_m7_tests PROPERTIES TIMEOUT 120)
 
     # Keep Python in the verification path without making it a build dependency.
     # Prefer the project's development venv, but allow an explicit interpreter.
@@ -154,6 +217,58 @@ if(BUILD_TESTING)
         set_tests_properties(go_pipeline_m2_m3_tests PROPERTIES
             TIMEOUT 60
             ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_data_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+        # M5: resume equivalence (2+2 epochs == 4 straight), dataset identity
+        # gates, per-epoch metrics JSONL, and dual-role checkpoint artifacts.
+        add_test(
+            NAME go_trainer_m5_resume
+            COMMAND "${GO_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_m5_resume.py"
+        )
+        set_tests_properties(go_trainer_m5_resume PROPERTIES
+            TIMEOUT 300
+            ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_train_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+        # M6: the C++ live feature extractor must match the Python trainer
+        # bitwise, or GTP play would feed the network different inputs than
+        # training saw.
+        add_test(
+            NAME go_features_m6_parity
+            COMMAND "${GO_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_m6_features.py"
+        )
+        set_tests_properties(go_features_m6_parity PROPERTIES
+            TIMEOUT 60
+            ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_rules_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+        # M6: GTP adapter protocol behavior + arena engines + SPRT math.
+        add_test(
+            NAME go_gtp_arena_m6
+            COMMAND "${GO_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_m6_gtp_arena.py"
+        )
+        set_tests_properties(go_gtp_arena_m6 PROPERTIES
+            TIMEOUT 600
+            ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_gtp_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+        # v2 cache: the per-sample move history must match the Python
+        # tokenizer frame by frame, and a v1 cache must be refused rather than
+        # silently substituted with zeros.
+        add_test(
+            NAME go_feature_cache_history
+            COMMAND "${GO_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_feature_cache_history.py"
+        )
+        set_tests_properties(go_feature_cache_history PROPERTIES
+            TIMEOUT 120
+            ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_train_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+        # M7: dual-head metrics + value targets must not be degenerate, B
+        # resume equivalence, and GTP genmove legality with a B model. Runs a
+        # tiny B config; the full B-vs-C claim lives in docs/benchmarks/m7-b-vs-c.md.
+        add_test(
+            NAME go_model_m7_python
+            COMMAND "${GO_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_m7_b_model.py"
+        )
+        set_tests_properties(go_model_m7_python PROPERTIES
+            TIMEOUT 600
+            ENVIRONMENT "GO_TEST_BINARY_DIR=$<TARGET_FILE_DIR:go_train_cli>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
         )
     endif()
     find_program(GNUGO_EXECUTABLE gnugo)

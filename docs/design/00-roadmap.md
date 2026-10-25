@@ -158,9 +158,9 @@ visits **数目**是可谈判条款（§2，40–100 已有实质战力——先
 | **M2** ✅ | 数据下载器 + SGF 解析 + `.nngames` | 1 万局入库，随机回放验证可逆 | M1 |
 | **M3** ✅ | `GoTokenizer` + 特征平面（19×19 特化） | 任意局面 → 特征张量，可视化自检 | M1 |
 | **M4** ✅ | **C 验证器竖切**（见 §4 DoD） | 全链路 + loss 下降 + ckpt 往返 + 评估可复现 | M2,M3 |
-| **M5** | `GoTrainer` 正式版：`--resume`、指标落盘、双角色存取 | 断点续训无损；监督配方可 CLI 表达 | M4 |
-| **M6** | GTP 适配器 + Arena（SPRT） | Sabaki 亲手可下；vs GnuGo 自动评估 | M1,M5 |
-| **M7** | **B 架构**替换 C（复合层 + 双头 + GoLoss + 合法性掩码） | 同数据显著优于 C；存盘/续训无损；推理速度 ≥ 预算（§7） | M5 |
+| **M5** ✅ | `GoTrainer` 正式版：`--resume`、指标落盘、双角色存取 | 断点续训无损；监督配方可 CLI 表达 | M4 |
+| **M6** ✅ | GTP 适配器 + Arena（SPRT） | Sabaki 亲手可下；vs GnuGo 自动评估 | M1,M5 |
+| **M7** | **B 架构**替换 C（复合层 + 双头 + GoLoss + 合法性掩码） | ⚠️ 架构/存盘/速度 达成；**"显著优于 C" 未达成**（见 §6.8） | M5 |
 | **M8** | **MCTS 推理引擎**（PUCT / 先验归一化 / 合法性 / 转置表；**只搜索不训练**——自对局训练循环随 D9 移出） | 9×9 沙盒（D2 允许）：vs 方案 1 纯先验显著增益；vs GnuGo 胜率达标；19×19 速度 ≥ §7 预算 | M6,M7 |
 | **M9** | 监督 10–30 万局正式训练 + 按赌约条件对 KataGo/对手调参（**无自对局微调**，D9） | 按赌约条件的正式评估达标 | M8 |
 
@@ -231,6 +231,72 @@ visits **数目**是可谈判条款（§2，40–100 已有实质战力——先
   1 MiB 栈缓冲与 Windows 默认线程栈冲突导致的模型校验溢出。
 - 完整数据和命令见 [`M4 验收`](../benchmarks/m4-c-validator.md)；格式见
   [`09-training-cache.md`](09-training-cache.md)。
+
+### 6.6 M5 执行记录（2026-10-24）
+
+- ✅ `--resume` 断点续训：`.nnckpt` 携带 TrainState（计数器/配方/数据集
+  身份）+ 优化器状态张量；续训恢复优化器 m/v/t 与 lr 曲线位置。
+- ✅ **续训无损在真实 CWI 数据上逐位验证**：2+2 epoch 与一口气 4 epoch
+  的 epoch 3/4 train/eval loss 与 top-1 完全相等（非四舍五入相等）。
+- ✅ 指标按 epoch 追加 JSONL（`--metrics-log`），跨进程续写同一文件；
+  checkpoint 写在 epoch 边界，崩溃最多丢一个 epoch。
+- ✅ 双角色：`.nnckpt`（3.0× 大小，含 16 个优化器张量）vs `.nnmodel`
+  （纯推理）；`.nnmodel` 不能当断点（角色门禁硬错）。
+- ✅ 监督配方 CLI 全表达（optimizer/schedule/beta/clip/warmup）并随断点
+  落盘；换数据集或改 `--epochs` 续训被身份门禁硬错拒绝。
+- 完整数据和命令见 [`M5 验收`](../benchmarks/m5-trainer.md)。
+
+### 6.7 M6 执行记录（2026-10-24）
+
+- ✅ C++ 实时特征提取（`go/features.hpp`）与 Python 训练管线**逐位一致**
+  （4 组对局全帧 float32 比对通过，含提子/ko/pass 占位/长局）。
+- ✅ GTP v2 适配器（`go_gtp_cli`）：GUI 所需命令全覆盖，genmove 在
+  KataGo 合法着上取模型 argmax，错误走 `? ` 前缀；规则全部复用 KataGo。
+- ✅ Arena（`go_arena_cli`）：random / model / 外部 GTP 子进程三种引擎，
+  颜色逐局轮换，SPRT（二项 LLR + α/β 边界）越界早停。
+- ✅ 实测：M5 训出的 C 验证器 vs random 19×19 四局 3 胜，SPRT 判定
+  `continue` 正确；GTP 子进程对手路径用自有 `go_gtp_cli` 验证
+  （play 转发 + genmove 解析）。
+- GnuGo 对评估以 `--opponent "gtp:gnugo --mode gtp --quiet"` 接入；
+  本机未装 gnugo，测试自动跳过（同 M1 语义）。
+- 完整数据和命令见 [`M6 验收`](../benchmarks/m6-gtp-arena.md)。
+
+### 6.8 M7 执行记录（2026-10-24）
+
+- ✅ **B 架构落地为单个复合层**（`go::GoModel`，GPTModel 同款写法）：
+  Conv stem（9→64→d，5×5 区域 token）+ 历史 embedding + decision query →
+  90 token 单序列 → `TransformerEncoderLayer` ×N（Pre-Norm，Plain 双向）→
+  LayerNorm → 策略(362)/价值(tanh) 双头 → 打包 `(363, batch)`。
+- ✅ **逐元素数学全部走 `dsl::compute`**（位置+段嵌入的融合加法、tanh、
+  tanh 雅可比 `1-t²`）；GPU 侧用 neuralnet.cpp 的标准机制接入 AOT 融合：
+  每个可执行目标把模型 TU 编进自己的收集器 + `nn_enable_gpu_fusion`，
+  850M 上实测无闭合世界 miss，存盘往返 diff 0.0（CPU/GPU 均为 0）。
+- ✅ **GoLoss**：行 [0,362) 稀疏 CE + 行 362 MSE，梯度拼回单张量。
+- ✅ **D6 零补丁 spec**：`Transformer + patch_size=5 + layer_dims[0]=0x476F4D31`，
+  训练器/评估器/策略端都能从 spec 精确重建（续训、evaluate、GTP、Arena）。
+- ✅ 契约测试：`go_model_tests`（常量 / spec 往返 / tiny 前反向 / GoLoss）、
+  `test_m7_b_model`（双头指标 + 非退化价值目标 + B 续训等价 + GTP 落子合法）。
+- ✅ 验收项 **存盘/续训无损**：`.nnckpt`/`.nnmodel` 往返 diff 0.0（C/B、CPU/GPU），
+  B 续训等价测试绿。
+- ✅ 验收项 **推理速度 ≥ 预算**：40HX 实测 **1312 pos/s**（§7 预算 915 pos/s，
+  batch 32，B-small 口径）。
+- ❌ 验收项 **同数据下 B 显著优于 C 未达成**。三档数据都试过（详见
+  [`M7 验收`](../benchmarks/m7-b-vs-c.md)）：
+
+  | 数据 | C top-1 | B top-1 |
+  |---|---:|---:|
+  | 30 局 / 6.4k 样本 | 1.74% | 1.27%（B 过拟合） |
+  | 110 局 / 21k 样本 | 4.62% | 4.57%（打平；对局 C 20:0） |
+  | 910 局 / 190k 样本 | **10.00%** | 5.80%（B 欠拟合） |
+
+  诊断与尝试：①价值头不是拖累（`--value-weight 0` 反而发散，说明它在当
+  辅助任务稳定主干）；②缩小规格到 d=128/6 层让 B 收敛快 4.5 倍但上限不变；
+  ③实现设计 §3.1 的兜底 **CNN 直通策略头**（`--cnn-policy 1`），把 B 抬到
+  8.23%（+2.5 pp）、差距从 4.3 pp 缩到 1.8 pp，但 6-epoch 调度只有 7.85%，
+  对局仍是 C 20:0。剩下的杠杆是 **M9 数据规模 + 更宽的模型**（d=192/256 +
+  直通头），不是调参。
+- 过程中修掉三个会静默错数的 bug：价值目标符号（`black` vs `b` 恒等 -1）、
+  价值 AUC 的并列名次公式、续训时 K 取自 `--history-len` 而非断点 spec。
 
 ## 7. 算力预算（推导口径，M0 用实测替换）
 

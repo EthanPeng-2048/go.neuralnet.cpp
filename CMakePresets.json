@@ -35,12 +35,12 @@
     {
       "name": "cpu",
       "configurePreset": "cpu",
-      "targets": ["go_neuralnet_m0", "layer_bench", "go_rules_cli", "go_rules_tests", "go_data_cli", "go_train_cli"]
+      "targets": ["go_neuralnet_m0", "layer_bench", "go_rules_cli", "go_rules_tests", "go_data_cli", "go_train_cli", "go_gtp_cli", "go_arena_cli"]
     },
     {
       "name": "gpu",
       "configurePreset": "gpu",
-      "targets": ["go_neuralnet_m0", "layer_bench", "go_rules_cli", "go_rules_tests", "go_data_cli", "go_train_cli"]
+      "targets": ["go_neuralnet_m0", "layer_bench", "go_rules_cli", "go_rules_tests", "go_data_cli", "go_train_cli", "go_gtp_cli", "go_arena_cli"]
     }
   ],
   "testPresets": [

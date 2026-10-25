@@ -4,7 +4,7 @@
 19×19 围棋训练与推理项目。模型、训练与 checkpoint 统一使用 neuralnet.cpp；
 棋规、SGF 和数据工程分别复用 KataGo、sgfmill 与 Python 生态。
 
-**当前状态：M0–M4 已完成，M5 尚未开始。**
+**当前状态：M0–M6 完成；M7 的 B 架构已落地（存盘/续训无损、推理 1312 pos/s 达标），但"同数据下 B 显著优于 C"未达成 —— 逐档数据与诊断见 [M7 验收](docs/benchmarks/m7-b-vs-c.md)。**
 
 | 里程碑 | 状态 | 产物 |
 |---|---|---|
@@ -13,6 +13,8 @@
 | M2 数据管线 | ✅ | 10,000 局 19×19 `.nngames`、KataGo 全量重放 |
 | M3 Token 与特征 | ✅ | GoTokenizer、`.nnvocab`、9 平面特征与可视化 |
 | M4 验证器竖切 | ✅ | 规则 → 特征 → C 模型训练 → 存取 → 评估 |
+| M5 GoTrainer | ✅ | `--resume` 逐位无损续训、指标 JSONL、双角色存取 |
+| M6 GTP + Arena | ✅ | Sabaki 可下的 GTP 适配器、Arena + SPRT 自动评估 |
 
 路线图与设计决策见 [`docs/design/00-roadmap.md`](docs/design/00-roadmap.md)，
 全部文档入口见 [`docs/README.md`](docs/README.md)，第三方版本唯一真源见
@@ -79,6 +81,41 @@ CWI 数据集的当前验收结果是 10,000 局、2,076,112 手、2,086,112 个
 checkpoint 和评估链路，不参与 B/C 模型优劣结论。训练缓存格式见
 [`M4 训练缓存`](docs/design/09-training-cache.md)，验收结果见
 [`M4 报告`](docs/benchmarks/m4-c-validator.md)。
+
+## M5 训练器
+
+```bash
+# 一口气 4 epoch
+./build/cpu/go_train_cli train --dataset train.ngf --eval-dataset eval.ngf \
+  --epochs 4 --batch-size 64 --lr 0.001 --seed 20261024 \
+  --checkpoint run.nnckpt --model run.nnmodel \
+  --metrics-out run.json --metrics-log run.jsonl
+
+# 第 2 个 epoch 后存档退出；断点续训补完剩余 epoch（指标续写同一 JSONL）
+./build/cpu/go_train_cli train ... --stop-after-epoch 2
+./build/cpu/go_train_cli train ... --resume run.nnckpt
+```
+
+`.nnckpt` 携带训练状态段（计数器/配方/数据集身份）与优化器状态，
+续训与一口气训练**逐位一致**；`.nnmodel` 是纯推理模型。换数据集或改
+`--epochs` 的续训会被身份门禁拒绝。验收结果见
+[`M5 报告`](docs/benchmarks/m5-trainer.md)。
+
+## M6 对局与评估
+
+```bash
+# GTP 适配器：Sabaki → Engine → Install Engine → Command:
+./build/cpu/go_gtp_cli --model run.nnmodel --gpu=40HX
+
+# Arena 自动评估（SPRT 判定；对手可以是 random / model / 外部 GTP 引擎）
+./build/cpu/go_arena_cli --player model:run.nnmodel \
+  --opponent "gtp:gnugo --mode gtp --quiet" \
+  --games 100 --size 19 --sprt-p0 0.5 --sprt-p1 0.55 --report arena.json
+```
+
+GTP 适配器的规则与特征提取复用 KataGo 与 M3 管线（与训练输入逐位一致）；
+Arena 用 KataGo 面积计分定胜负。验收结果见
+[`M6 报告`](docs/benchmarks/m6-gtp-arena.md)。
 
 ## 棋规
 

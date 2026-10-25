@@ -42,6 +42,9 @@ stable so existing links do not change.
 | [M1 rules](benchmarks/m1-rules.md) | Rule tests, replay, latency, and GnuGo cross-check |
 | [M2/M3 data and features](benchmarks/m2-m3-data.md) | Dataset counts, replay, round-trip, tokenizer, and feature evidence |
 | [M4 C validator](benchmarks/m4-c-validator.md) | Measured 40HX training, reproducibility, and model round-trip |
+| [M5 trainer](benchmarks/m5-trainer.md) | Bitwise resume equivalence, metrics JSONL, dual-role artifacts |
+| [M6 GTP and arena](benchmarks/m6-gtp-arena.md) | Feature parity, GTP protocol behavior, arena and SPRT |
+| [M7 B architecture](benchmarks/m7-b-vs-c.md) | GoModel/GoLoss on dsl::compute, AOT fusion, B vs C on shared data |
 
 ## Evidence labels
 

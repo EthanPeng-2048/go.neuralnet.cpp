@@ -264,7 +264,10 @@ class M3FeatureTests(unittest.TestCase):
                 ).stdout
             )
             self.assertEqual(inspected["format"], "go.feature-cache")
-            self.assertEqual(inspected["format_version"], 1)
+            # v2 adds the per-sample move-history block; the M3 plane payload is
+            # unchanged, so every other assertion stays the same.
+            self.assertEqual(inspected["format_version"], 2)
+            self.assertEqual(inspected["history_len"], 64)
             self.assertEqual(inspected["records"], 3)
             self.assertEqual(inspected["features"], 9 * 19 * 19)
             self.assertEqual(inspected["board_size"], 19)
