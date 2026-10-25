@@ -34,6 +34,11 @@ namespace {
 using json = nlohmann::json;
 using nn::Scalar;
 
+// M5 健康门基线（未训练模型 @ 训练集 loss）只是"下降发生了吗"的参照，
+// 不需要全量精度：32k 样本的均值对"下降几 nat"的判定绰绰有余，而全量
+// 前向在 60 万+ 样本的数据集上要数小时（曾把开训时间顶到不可用）。
+constexpr std::size_t kBaselineSamples = 32768;
+
 struct CommonOptions {
     bool use_gpu = false;
     std::string gpu_device;
@@ -920,8 +925,8 @@ int train(const TrainOptions& options) {
         : options.epochs;
     if (planned_final_epoch > start_epoch) {
         first_train_loss = evaluate(
-            *model, train_cache, options.common.batch_size, 0, history_len,
-            options.value_weight
+            *model, train_cache, options.common.batch_size, kBaselineSamples,
+            history_len, options.value_weight
         ).loss;
         model->set_training(true);
     }
