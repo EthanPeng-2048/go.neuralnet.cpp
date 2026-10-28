@@ -14,6 +14,7 @@ with the dependency baseline before changing a third-party component.
 | [Data and feature format](design/08-data-and-features.md) | `.nngames`, GoTokenizer, `.nnvocab`, and feature-plane contracts |
 | [M4 training cache](design/09-training-cache.md) | Versioned `.ngf` cache and C validator data flow |
 | [GUI (play + arena)](design/10-gui.md) | Local play/arena GUI, engine specs, and the HTTP contract |
+| [M8–M10 问题总账与开发史](history/m8-m10-problems-and-history.md) | 价值头问题清单（P1–P7）、研究排查过程、MCTS/价值头实验编年史 |
 | [Dependencies](../DEPENDENCIES.md) | Exact versions, commits, licenses, and upgrade gates |
 | [Contributing](../CONTRIBUTING.md) | Build, test, dependency, and data-artifact rules |
 
