@@ -49,6 +49,12 @@ SHA-256 使用 1 MiB 栈缓冲，而 Windows 默认线程栈约 1 MiB；该设�
   （类型名 `GoTransformer`，经 `ModelRegistry` 注册），保留 v1.13 及更早扁平
   Transformer 规格的只读兼容层；训练状态段复用 `nn::TextTrainState` 承载数据
   集身份（旧 Go 断点无 `state_kind` 键，读回即 text kind，与上游工厂口径一致）。
+  **训练器已按 v1.14.1 骨架重写**（RunDriver + IndexedBatchSource +
+  TrainingSession::save_checkpoint/resume）。暂不定义 `GoTrainState`：上游
+  `train_state_from_kv` 工厂硬编码只认 text kind、无自定义 kind 注册表，
+  自定义 kind 的断点写了读不回来——已报上游
+  [issue #44](https://github.com/neuralnet-cpp-dev/neuralnet.cpp/issues/44)，
+  待注册表落地后切换。
 - v1.12.0 奠定的 RL 与可组合训练基础设施（具名多输出、schema 化 experience、
   GAE/return/group normalization、REINFORCE/PPO/GRPO objectives、
   `TrainingGroupSession` 与 `RLTrainingPipeline`）保持可用。

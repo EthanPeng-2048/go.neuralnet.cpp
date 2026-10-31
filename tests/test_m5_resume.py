@@ -263,7 +263,9 @@ class M5TrainerTests(unittest.TestCase):
                 text=True,
             )
             self.assertNotEqual(rejected.returncode, 0)
-            self.assertIn("数据集与断点不一致", rejected.stderr)
+            # v1.14.1 起数据集身份门禁由库口径（verify_resume Strict →
+            # TextTrainState::verify_extra）给出，文案是"数据集身份不一致"。
+            self.assertIn("数据集身份不一致", rejected.stderr)
 
     def test_resume_rejects_epoch_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

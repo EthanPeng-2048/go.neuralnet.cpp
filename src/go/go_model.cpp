@@ -77,7 +77,8 @@ bool GoTransformerSpec::arch_compatible(
            config.history_len == peer->config.history_len &&
            config.history_vocab == peer->config.history_vocab &&
            config.region_grid == peer->config.region_grid &&
-           config.cnn_policy == peer->config.cnn_policy;
+           config.cnn_policy == peer->config.cnn_policy &&
+           config.value_from_spatial == peer->config.value_from_spatial;
 }
 
 std::string GoTransformerSpec::summary(const nn::ModelSpec&) const {
@@ -87,7 +88,8 @@ std::string GoTransformerSpec::summary(const nn::ModelSpec&) const {
            ",d_ff=" + std::to_string(config.d_ff) +
            ",conv=" + std::to_string(config.conv_channels) +
            ",history=" + std::to_string(config.history_len) +
-           (config.cnn_policy ? ",cnn_policy=1" : "") + ")";
+           (config.cnn_policy ? ",cnn_policy=1" : "") +
+           (config.value_from_spatial ? ",value_spatial=1" : ",value_spatial=0") + ")";
 }
 
 void GoTransformerSpec::write_kv(nn::KeyValueRecord& kv) const {
@@ -110,6 +112,11 @@ void GoTransformerSpec::write_kv(nn::KeyValueRecord& kv) const {
         config.history_vocab,
         config.cnn_policy ? std::uint64_t{1} : std::uint64_t{0},
     });
+    // M10 价值头接线（开放规格的具名键，不进 layer_dims 魔数下标）。
+    // 总是写出；旧文件缺键 ⇒ read_kv 回退 query 接线（旧权重形状 (1,d)）。
+    kv.set("value_from_spatial", static_cast<std::uint64_t>(
+        config.value_from_spatial ? 1 : 0
+    ));
 }
 
 nn::Result<void> GoTransformerSpec::read_kv(const nn::KeyValueRecord& kv) {
@@ -161,6 +168,14 @@ nn::Result<void> GoTransformerSpec::read_kv(const nn::KeyValueRecord& kv) {
     config.history_vocab = static_cast<std::size_t>(dims[4]);
     config.region_grid = static_cast<std::size_t>(dims[3]);
     config.cnn_policy = dims.size() >= 6 && dims[5] != 0;
+    // M10 价值头接线：缺键（v1.13 及更早 / a01790e 之前的 GoTransformer）
+    // 回退旧接线（价值头读 query），老 .nnmodel/.nnckpt 保持可加载且
+    // 行为与训练时一致——权重形状 (1, d) vs (1, d·25) 由该键区分。
+    {
+        std::uint64_t value_spatial = 0;
+        config.value_from_spatial =
+            kv.get("value_from_spatial", value_spatial) && value_spatial != 0;
+    }
 
     if (config.conv_channels == 0 || config.history_len == 0 ||
         config.history_vocab < history_vocab_size) {
@@ -390,7 +405,12 @@ GoModel::GoModel(const GoModelConfig& config)
       relu2_(),
       ln_f_(nn::make_norm_layer(config.d_model, nn::NormType::LayerNorm)),
       policy_head_(config.d_model, policy_class_count),
-      value_head_(config.d_model, 1),
+      // M10：价值头读盘面特征图 r2（d·25）时输入维随之放大；旧接线读
+      // query（d）。权重形状由该维决定，spec 具名键 value_from_spatial
+      // 保证两者互不误载。
+      value_head_(config.value_from_spatial
+                      ? config.d_model * region_token_count
+                      : config.d_model, 1),
       cnn_policy_head_(config.d_model * region_token_count, policy_class_count) {
     validate_config(config);
     // 4×4 stride 4 padding 1 把 19×19 压到 5×5：区域 token 数必须与常量一致。
@@ -406,6 +426,12 @@ GoModel::GoModel(const GoModelConfig& config)
             config.d_model, config.num_heads, config.d_ff, seq_len_,
             nn::NormType::LayerNorm
         );
+    }
+    // 价值头输入归一化：r2 未归一化直接进 Linear+tanh 会饱和
+    //（float32 下 tanh(|x|≳9) 精确 =±1 → 1-t²=0 → 价值头零梯度）。
+    if (config.value_from_spatial) {
+        value_norm_ = nn::make_norm_layer(
+            config.d_model * region_token_count, nn::NormType::LayerNorm);
     }
 }
 
@@ -449,6 +475,9 @@ nn::Result<void> GoModel::init_impl(nn::ComputeEngine& engine) {
     NN_TRY(r4, ln_f_->init(engine));
     NN_TRY(r5, policy_head_.init(engine));
     NN_TRY(r6, value_head_.init(engine));
+    if (value_norm_) {
+        NN_TRY(r8, value_norm_->init(engine));
+    }
     if (cfg_.cnn_policy) {
         NN_TRY(r7, cnn_policy_head_.init(engine));
     }
@@ -463,6 +492,8 @@ std::vector<nn::TensorRef> GoModel::parameters() {
         collect_block_refs_(blocks_, &nn::TransformerEncoderLayer::parameters),
         ln_f_->parameters(),
         policy_head_.parameters(), value_head_.parameters(),
+        value_norm_ ? value_norm_->parameters()
+                    : std::vector<nn::TensorRef>{},
         cfg_.cnn_policy ? cnn_policy_head_.parameters()
                         : std::vector<nn::TensorRef>{}
     );
@@ -475,6 +506,8 @@ std::vector<nn::TensorRef> GoModel::param_gradients() {
         collect_block_refs_(blocks_, &nn::TransformerEncoderLayer::param_gradients),
         ln_f_->param_gradients(),
         policy_head_.param_gradients(), value_head_.param_gradients(),
+        value_norm_ ? value_norm_->param_gradients()
+                    : std::vector<nn::TensorRef>{},
         cfg_.cnn_policy ? cnn_policy_head_.param_gradients()
                         : std::vector<nn::TensorRef>{}
     );
@@ -491,10 +524,71 @@ std::vector<nn::Layer*> GoModel::param_children() noexcept {
     children.push_back(ln_f_.get());
     children.push_back(&policy_head_);
     children.push_back(&value_head_);
+    if (value_norm_) {
+        children.push_back(value_norm_.get());
+    }
     if (cfg_.cnn_policy) {
         children.push_back(&cnn_policy_head_);
     }
     return children;
+}
+
+nn::Result<std::vector<std::pair<std::string, double>>>
+GoModel::debug_grad_norms() {
+    nn::ComputeEngine& engine = engine_ref();
+    // 逐张量读回算 L2（诊断专用：GPU 上每张量一次同步，不进热路径）。
+    const auto group_norm = [&engine](const std::vector<nn::TensorRef>& refs)
+        -> nn::Result<double> {
+        double sum_sq = 0;
+        for (const nn::TensorRef& ref : refs) {
+            nn::Tensor& tensor = ref.get();
+            if (!tensor.valid()) {
+                continue;
+            }
+            std::vector<nn::Scalar> buffer(tensor.size(), nn::Scalar{0});
+            NN_TRY_CHECK(engine.read(tensor, std::span<nn::Scalar>(buffer)));
+            for (nn::Scalar value : buffer) {
+                const double v = static_cast<double>(value);
+                sum_sq += v * v;
+            }
+        }
+        return std::sqrt(sum_sq);
+    };
+
+    std::vector<std::pair<std::string, double>> out;
+    const auto emit = [&out](const char* name, double norm) {
+        out.emplace_back(name, norm);
+    };
+
+    NN_TRY(embed, group_norm(
+        std::vector<nn::TensorRef>{
+            grad_hist_emb_, grad_pos_emb_, grad_seg_emb_, grad_query_tok_}));
+    emit("embeddings", *embed);
+    NN_TRY(conv1, group_norm(conv1_.param_gradients()));
+    emit("conv1", *conv1);
+    NN_TRY(conv2, group_norm(conv2_.param_gradients()));
+    emit("conv2", *conv2);
+    double blocks_sq = 0;
+    for (auto& block : blocks_) {
+        NN_TRY(bn, group_norm(block.param_gradients()));
+        blocks_sq += (*bn) * (*bn);
+    }
+    emit("blocks", std::sqrt(blocks_sq));
+    NN_TRY(ln_f, group_norm(ln_f_->param_gradients()));
+    emit("ln_f", *ln_f);
+    NN_TRY(policy, group_norm(policy_head_.param_gradients()));
+    emit("policy_head", *policy);
+    NN_TRY(value, group_norm(value_head_.param_gradients()));
+    emit("value_head", *value);
+    if (value_norm_) {
+        NN_TRY(vn, group_norm(value_norm_->param_gradients()));
+        emit("value_norm", *vn);
+    }
+    if (cfg_.cnn_policy) {
+        NN_TRY(cnn, group_norm(cnn_policy_head_.param_gradients()));
+        emit("cnn_policy", *cnn);
+    }
+    return out;
 }
 
 void GoModel::set_precision_profile(const nn::PrecisionProfile& profile) {
@@ -509,6 +603,7 @@ void GoModel::set_precision_profile(const nn::PrecisionProfile& profile) {
     if (ln_f_) ln_f_->set_precision_profile(profile);
     policy_head_.set_precision_profile(profile);
     value_head_.set_precision_profile(profile);
+    if (value_norm_) value_norm_->set_precision_profile(profile);
     if (cfg_.cnn_policy) cnn_policy_head_.set_precision_profile(profile);
 }
 
@@ -524,6 +619,7 @@ void GoModel::set_training(bool training) {
     if (ln_f_) ln_f_->set_training(training);
     policy_head_.set_training(training);
     value_head_.set_training(training);
+    if (value_norm_) value_norm_->set_training(training);
     if (cfg_.cnn_policy) cnn_policy_head_.set_training(training);
 }
 
@@ -538,6 +634,7 @@ void GoModel::clear_cache() {
     if (ln_f_) ln_f_->clear_cache();
     policy_head_.clear_cache();
     value_head_.clear_cache();
+    if (value_norm_) value_norm_->clear_cache();
     if (cfg_.cnn_policy) cnn_policy_head_.clear_cache();
 }
 
@@ -699,7 +796,14 @@ nn::Result<Tensor> GoModel::forward(const Tensor& input) {
             policy_class_count, batch, p_.compute));
         logits = std::move(merged);
     }
-    NN_TRY(value_pre, value_head_.forward(*q_col));    // (1, batch)
+    // M10：价值头读盘面特征图 r2（KataGo 同款接线）——query token 被 362
+    // 类策略损失主导，价值信号流不进去（实测三代模型 value AUC 塌缩 0.5）。
+    // 读 r2 前过专用 LayerNorm：未归一化的卷积输出直进 Linear+tanh 会饱和
+    //（float32 下 tanh(|x|≳9) 精确 =±1 → 1-t²=0 → 价值头零梯度）。
+    nn::Result<Tensor> value_in = cfg_.value_from_spatial
+        ? value_norm_->forward(*r2)
+        : nn::Result<Tensor>(std::move(*q_col));
+    NN_TRY(value_pre, value_head_.forward(*value_in));  // (1, batch)
     NN_TRY(value, nn::dsl::compute(engine,
         nn::dsl::tanh(nn::dsl::leaf(*value_pre)), 1, batch, p_.compute));
     value_t_ = std::move(*value);
@@ -739,11 +843,29 @@ nn::Result<Tensor> GoModel::backward(const Tensor& grad_output) {
             (nn::dsl::rparam(Scalar{1}) - nn::dsl::leaf(value_t_) * nn::dsl::leaf(*t_copy)),
         1, batch, p_.compute));
 
-    // ── 3. 双头反传并合并到 query 列 ───────────────────────────────────
-    NN_TRY(b_policy, policy_head_.backward(*g_policy));
-    NN_TRY(b_value, value_head_.backward(*g_pre));
-    NN_TRY(g_query, nn::dsl::compute(engine,
-        nn::dsl::leaf(*b_policy) + nn::dsl::leaf(*b_value), d, batch, p_.compute));
+    // ── 3. 双头反传 ─────────────────────────────────────────────────────
+    // 接线路由（M10/M10b）：
+    // · legacy：价值头读 query，输入梯度与策略头合并回传 query；
+    // · spatial（探针式）：价值头读 LayerNorm(r2)，**输入梯度不回流 trunk**。
+    //   第一版让它并入盘面分支，实测把策略摧毁（epoch1 top1 27.8%→0.8%）：
+    //   LayerNorm 反向的 1/std 放大让价值梯度比策略梯度大 2-3 个量级，而
+    //   clip_grad_norm 是全局裁剪 → 裁剪系数被价值分支压到极小 → 策略头
+    //   拿不到有效更新。trunk 在拿到自身归一化（BN 类）之前，价值头只做
+    //   "探针"：读空间特征、学自己的权重（价值头/γ/β 梯度照常），不塑形
+    //   共享 trunk——KataGo 的联合塑形等 trunk 归一化落地后再开。
+    NN_TRY(b_policy, policy_head_.backward(*g_policy));   // (d, batch)
+    nn::Result<Tensor> g_query = std::move(*b_policy);
+    if (cfg_.value_from_spatial) {
+        // 反向照走（价值头与 norm 的权重/γ/β 梯度由此产生），输入梯度丢弃。
+        NN_TRY(b_value_pre, value_head_.backward(*g_pre));   // (d·25, batch)
+        NN_TRY_CHECK(value_norm_->backward(*b_value_pre));   // γ/β 梯度
+    } else {
+        NN_TRY(b_value, value_head_.backward(*g_pre));       // (d, batch)
+        NN_TRY(merged_q, nn::dsl::compute(engine,
+            nn::dsl::leaf(*g_query) + nn::dsl::leaf(*b_value), d, batch,
+            p_.compute));
+        g_query = std::move(*merged_q);
+    }
 
     // ── 4. query 列 → 序列行空间（其余位置梯度为 0）────────────────────
     NN_TRY(g_query_rows, engine.transpose(*g_query));   // (batch, d)
@@ -794,6 +916,7 @@ nn::Result<Tensor> GoModel::backward(const Tensor& grad_output) {
             cfg_.d_model * region_token_count, batch, p_.compute));
         board_grad = std::move(*merged_grad);
     }
+    // （spatial 接线的价值梯度在此前已丢弃——探针式，见第 3 步注释。）
     NN_TRY(b_r2, relu2_.backward(board_grad));
     NN_TRY(b_c2, conv2_.backward(*b_r2));
     NN_TRY(b_r1, relu1_.backward(*b_c2));
@@ -849,6 +972,9 @@ nn::Result<Scalar> GoLoss::forward(
     NN_TRY(value_target, nn::detail::upload_span(
         engine, 1, batch, nn::Precision::F32, values));
     NN_TRY(value_loss, value_loss_.forward(engine, *value_pred, *value_target));
+    // 诊断：留档未加权分项（价值 AUC 停滞时看价值 MSE 是否真在降）。
+    last_policy_loss_ = *policy_loss;
+    last_value_loss_ = *value_loss;
 
     // 两段梯度拼回 (363, batch)：策略段直接拷入，价值段按权重缩放后拷入。
     NN_TRY(g_policy, policy_loss_.backward());        // (362, batch)

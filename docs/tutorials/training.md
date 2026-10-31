@@ -276,8 +276,8 @@ loss 绝对值不可比 —— B/C 对照请用同一份 `.ngf` 缓存比 eval t
 | `ingest` 报同样的 checksum 错 | `ingest` 也会校验已存在的归档（不重下） | 先按 §2.2 修好归档，再 `ingest` |
 | `B model needs move history but cache '…' has history_len=0` | 喂了 v1 缓存（无历史段）给 B 模型 | 用 `training-cache --history-len 64` 重新生成 v2 缓存 |
 | `feature cache history span has wrong size … K=…` | 训练 `--history-len` 与缓存 K 不一致 | 两边统一为 64，或按报错提示重新生成缓存 |
-| `--resume 的数据集与断点不一致` | `.ngf` 内容身份变了（重生成/换数据） | 换数据集属新任务：从 `.nnmodel` 重开，不要 `--resume` |
-| `--epochs 与断点配方不一致` | 续训时改了总 epoch 数 | 用与断点相同的 `--epochs`；真要改配方就重开一轮 |
+| `续训交叉校验: 数据集身份不一致`（v1.14.1 库口径） | `.ngf` 内容身份变了（重生成/换数据） | 换数据集属新任务：从 `.nnmodel` 重开，不要 `--resume` |
+| `续训交叉校验: 配方 epochs 不一致` | 续训时改了总 epoch 数 | 用与断点相同的 `--epochs`；真要改配方就重开一轮 |
 | `vkAllocateMemory failed`（GPU） | batch 超出显存 | 降 `--batch-size`（850M 实测 16 可行、32 不行） |
 | `only found N usable 19x19 games` | 数据集不足 `--limit` 局 | 降低 `--limit` 或换数据源（换源按 §2.2 上游变更流程） |
 | `找不到 go_data_cli`（FileNotFoundError） | 只构建了 `gpu` preset（旧版写死 `build/cpu`） | 新版自动探测 `build/gpu`；或 `--build-dir build/gpu`；或 `--data-cli/--rules-cli` 直接给路径 |

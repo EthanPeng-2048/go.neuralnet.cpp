@@ -34,6 +34,8 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <neuralnet.cpp/nn.hpp>
@@ -76,6 +78,17 @@ struct GoModelConfig {
     // 设计 §3.1 兜底：策略头 + CNN 直通 logits。盘面细节不再只能经 25 个区域
     // token 挤进 query——特征图展平后直接线性出 362 类，与 query 的 logits 相加。
     bool cnn_policy = false;
+    // M10 修复（价值头接线）：价值头改读盘面特征图 r2（d·25，经专用
+    // LayerNorm），而不是 query token。旧接线里 query 被 362 类策略损失
+    // 主导，价值信号进不去——三代模型实测 value AUC 全部塌缩到 0.5。
+    // M10b：spatial 接线为**探针式**——价值头读空间特征、学自己的权重，
+    // 但输入梯度不回流共享 trunk（第一版回流实测把策略摧毁：全局
+    // clip_grad_norm 被放大的价值梯度压死，epoch1 top1 27.8%→0.8%）。
+    // trunk 的联合塑形等 trunk 归一化（BN 类）落地后再开。
+    // spec 具名键 `value_from_spatial` 记录该接线；旧 spec（v1.13 及更早、
+    // 或 a01790e 之前的 GoTransformer 文件）缺键 ⇒ 回退旧接线，老
+    // .nnmodel/.nnckpt 保持可加载且行为与训练时一致。
+    bool value_from_spatial = true;
 };
 
 // neuralnet.cpp v1.14.1 的开放模型规格：类型参数与判别符随 ModelSpecBase
@@ -144,6 +157,14 @@ public:
     void set_training(bool training) override;
     void clear_cache() override;
 
+    // M10b 诊断埋点：按参数组返回梯度 L2 范数（embeddings / conv1 / conv2 /
+    // blocks / ln_f / policy_head / value_head / value_norm / cnn_policy）。
+    // backward 后、clip 前调用——用于确认真实训练中价值头梯度量级（价值
+    // AUC 停滞时区分"梯度断了"与"梯度有但信号弱"）。逐张量读回宿主，
+    // 只应挂在低频诊断钩子上，不进热路径。
+    [[nodiscard]] nn::Result<std::vector<std::pair<std::string, double>>>
+    debug_grad_norms();
+
 protected:
     [[nodiscard]] std::vector<nn::Layer*> param_children() noexcept override;
 
@@ -194,6 +215,13 @@ private:
     nn::Tensor ids_flat_;   // (batch, K)  历史 id（gather 的平铺序，
                             // scatter_add_rows 复用同一张量）
     nn::Tensor value_t_;    // (1, batch)  tanh 输出（值头反传的 1-t² 需要）
+    // 价值头输入归一化（仅 spatial 接线构造；legacy 为空、参数序不变）：
+    // r2 是未归一化的卷积输出，直接进 Linear+tanh 会饱和——float32 下
+    // |x|≳9 时 tanh 精确 =±1 → 1-t² 精确归零 → 价值头连自己的权重都拿不到
+    // 梯度（M10 实测 vhead 梯度全 0）。探针式接线下它照常训练（γ/β 有
+    // 梯度），只是它的输入梯度不进 trunk。
+    std::unique_ptr<nn::Layer> value_norm_;
+
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -225,7 +253,18 @@ public:
 
     [[nodiscard]] nn::Result<nn::Tensor> backward() override;
 
+    // 分项损失（诊断）：forward 之后可读最近一次的策略 CE 与价值 MSE 原值
+    //（未加权）。价值 AUC 停滞时用来判断价值 MSE 是否真的在降。
+    [[nodiscard]] nn::Scalar last_policy_loss() const noexcept {
+        return last_policy_loss_;
+    }
+    [[nodiscard]] nn::Scalar last_value_loss() const noexcept {
+        return last_value_loss_;
+    }
+
 private:
+    nn::Scalar last_policy_loss_ = 0;
+    nn::Scalar last_value_loss_ = 0;
     nn::Scalar value_weight_;
     nn::CrossEntropyLoss policy_loss_;
     nn::MSELoss value_loss_;

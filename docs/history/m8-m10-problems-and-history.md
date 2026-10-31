@@ -17,6 +17,11 @@ MCTS 搜索树本身已验收通过（同一网络下搜索 6:0 碾压纯先验�
 是当前候选，epoch 2 双门（top1 > 20% **且** value_auc > 0.53）未过，
 已按预设规则停训，等待下一步决策（见 §6）。
 
+**2026-11-01 更新**：P2 结案（测试数据无符号下溢，非工具链）；M10b 诊断代码
+（value_from_spatial 具名 spec 键 / debug_grad_norms / --grad-debug / 分项损失）
+按 v1.14.1 开放规格落地进 main；训练器重写为 RunDriver + IndexedBatchSource +
+session.save_checkpoint/resume（库口径断点编排）。
+
 ---
 
 ## 1. 目标与判据背景
@@ -63,31 +68,34 @@ MCTS 搜索树本身已验收通过（同一网络下搜索 6:0 碾压纯先验�
   ② 探针改读 transformer 之后的特征（当前 r2 是 conv 输出区域 token，
   未经过注意力融合）；③ trunk 归一化后开联合塑形（回到 v2 但修好洪泛根因）。
 
-### P2【高·未定根因】本机 CPU 构建下稀疏 CE 返回未初始化垃圾（预先存在）
+### P2【已结案·2026-11-01】稀疏 CE "返回垃圾" = 测试数据无符号下溢（不是上游/工具链 bug）
 
-- **现象**：CPU 构建中，forward_sparse（logsumexp fold 路径）输出 −0 或
-  1e18 量级垃圾：batch=1,2 → ce=-0；batch≥3 → 未初始化内存值
-  （如 1229783002385481728、922337286148849664）；logsumexp 中间量为 inf。
-- **发现路径**：给 GoLoss 测试加「分项损失为正」断言 → 失败 →
-  debug 打出 combined=0.729167 policy=-0.000000 value=0.729167
+- **现象（旧记录）**：CPU 构建中，forward_sparse（logsumexp fold 路径）
+  输出 −0 或 1e18 量级垃圾：batch=1,2 → ce=-0；batch≥3 → 未初始化内存值；
+  logsumexp 中间量为 inf。发现路径：给 GoLoss 测试加「分项损失为正」断言
+  → 失败 → debug 打出 combined=0.729167 policy=-0.000000 value=0.729167
   （combined 纯粹是价值 MSE）。
-- **排查结论**：
-  - **不是诊断改动引入的**——git stash 掉全部改动后 HEAD 原码同样 CE=0
-    （临时 [orig] printf 验证）；
-  - **纯头文件探针复现**（/tmp/ce_sweep.cpp，无任何 go 代码）：同样失败；
-  - 与优化级别（-O0/-O1/-O2/-O3）、编译器（clang-24 与 g++-15.2）、
-    engine 创建方式（CpuEngine::create() 与 nn::cli::create_engine 工厂）均无关；
-  - PCH 排除（纯探针不经 CMake）；
-  - **时间线**：m7-c 于 10-24 在本机 CPU 训练正常（loss 5.85→5.45）；
-    10-25 20:07 起 clang-24 首装并连续升级，apt 日志显示同期
-    libstdc++/gcc-16-base 16-2026322 更新 ⇒ **头文件/工具链升级嫌疑最大，
-    根因未定案**。
-- **影响面**：GPU（40HX，真实训练管线）CE 计算正常
-  （m10-b3 初始 eval loss 7.97 > 价值 MSE 理论上限 4，即 CE 分量非零）；
-  **受污染的是本机 CPU 测试二进制与任何本机 CPU 训练**——当前
-  go_model_tests 会有 1 个 CE 断言失败（这是真警报，不是误报）。
-- **风险**：任何人用本机 CPU 跑训练/评估都会静默得到「只学价值头」的模型。
-  在根因定案前：**禁止本机 CPU 训练结论入库**。
+- **结案结论（2026-11-01，WP1 落地诊断埋点时顺手破案）**：
+  - 此前所有"复现"探针（含纯头文件的 /tmp/ce_sweep.cpp）都用
+    `(i % 7) - 3` 构造测试 logits——`i` 是 `std::size_t`，余数 < 3 时
+    `0-3` 下溢成 `2^64-3` ≈ 1.8e19，转 float 得 1.8e18 级垃圾。
+    **exp(1.8e18) = inf ⇒ CE 输出 NaN/−0/1e18，全是构造出来的烂数据**；
+  - 决定性证据：同一引擎、同一路径，把 `(i % 7) - 3` 换成
+    `static_cast<int>(i % 7) - 3` 后，classes ∈ {8,64,362} ×
+    batch ∈ {1,3} 全部返回正确 CE（1.86–6.01）；
+  - 位模式验证：write 后 read 回来的 back[0] 位模式 = `0x5dcccccd`
+    （= 0.1f 的高位被下溢整数污染），与源缓冲逐位相同——引擎读写无误，
+    错在宿主侧数据构造；
+  - **上游 v1.14.1 的 fold logsumexp / 稀疏 CE 实现无 bug**；工具链嫌疑
+    （clang-24 / libstdc++ 16 与症状同期升级）为**误判**，时间线巧合。
+    此前的"与优化级别/编译器无关"排查之所以没抓到，是因为所有复现体
+    都复制了同一个错误构造。
+- **修复**：tests/go_model_tests.cpp 三处 `(size_t 表达式) - 正数` 改为
+  先转 `int` 再做减法（test_forward_backward 平面数据 / grad_data /
+  test_go_loss logits）。修复后 go_model_tests 全绿。
+- **解除的限制**：「禁止本机 CPU 训练结论入库」自 2026-11-01 起作废。
+- **教训**：大批量"与工具链无关、纯头文件复现"的排查里，先检查
+  **测试数据构造本身**（位模式验证 > 推断时间线）。
 
 ### P3【已修复·教训】m10-b2 trunk 洪泛事故
 
@@ -114,16 +122,15 @@ MCTS 搜索树本身已验收通过（同一网络下搜索 6:0 碾压纯先验�
   Windows 主机 192.168.1.102（ethan）的 CMP 40HX 原生 Vulkan；
 - WSL 内 2060S GPU 已废弃（Dozen descriptor pool 耗尽）。
 
-### P6【工程债】诊断代码在 stash，工作树有临时 printf
+### P6【已清偿·2026-11-01】诊断代码在 stash，工作树有临时 printf
 
-- stash diag-go-loss（4 文件）含：GoLoss 分项损失访问器
-  （last_policy_loss()/last_value_loss()）、GoModel::debug_grad_norms()
-  （按参数组返回梯度 L2 范数）、--grad-debug N 钩子（每 N 步写
-  *.grads.jsonl：epoch/step/policy_loss/value_loss/grad_l2）、对应测试
-  （split-loss 恒等式 + value 路由断言）。均已编译通过。
-- 工作树 = HEAD + tests/go_model_tests.cpp 里一行临时 [orig] printf
-  （**恢复前必须先 git checkout tests/go_model_tests.cpp 再 git stash pop**）。
-- 这些代码目前**未在 GPU 管线上验证过**（Windows 构建未同步）。
+- ✅ **已清偿（2026-11-01）**：stash 内容按 v1.14.1 开放规格重做后落进
+  main（value_from_spatial 从 layer_dims[7] 魔数改为 GoTransformerSpec
+  具名键 `value_from_spatial`，旧 spec 缺键回退旧接线；[dbg] printf 噪声
+  剥除；新增价值头路由回归门 test_value_head_routing + 分项损失恒等式）。
+  stash 已 drop。
+- ⚠ 仍未在 GPU 管线上验证（Windows 构建未同步）——M10b 下一轮训练前先
+  touch 后重建 build\gpu。
 
 ### P7【历史事故账】（均已修复，留档防再犯）
 
@@ -269,12 +276,12 @@ CWI 10k 数据、共享 500 局评估集 ~104k 价值样本。
 
 ### 5.3 已实施但未跑的实验清单
 
-- [ ] Windows GPU 构建同步诊断源码（4 文件），touch 后重建 build\gpu；
+- [ ] Windows GPU 构建同步诊断源码（已进 main，touch 后重建 build\gpu）；
 - [ ] 用 m10-b3 epoch-2 checkpoint + --grad-debug 200 短跑几百步：
   看 value_head/value_norm 的 grad_l2 与 policy_head 对比，
   以及 train_value_loss 是否有下降趋势；
-- [ ] P2 根因（可先做最小 bisect：10-24 已知好状态 vs 当前 libstdc++ 的
-  logsumexp fold 路径）。
+- [x] P2 根因 —— **2026-11-01 结案**：测试数据无符号下溢（见 §2 P2），
+  上游无 bug，无需 bisect 工具链。
 
 ---
 

@@ -8,6 +8,38 @@ semantic versioning once public model or data formats are declared stable.
 
 ### Changed
 
+- 训练器（go_train_cli）按 neuralnet.cpp v1.14.1 训练骨架重写：手搓的
+  epoch/step 循环、lr 接线与断点拼装全部替换为库口径——`RunDriver`
+  （epoch/step 循环 + lr 调度 + 断点节奏 + 报告聚合）、`IndexedBatchSource`
+  （epoch 网格 + 单流重放 shuffle；数据序语义变更，旧 checkpoint 不承诺
+  数据序兼容）、`TrainingSession::save_checkpoint/resume`（v1.14.1 的
+  无半提交与优化器 t 权威值修复随之生效）。续训门禁改用 `verify_resume`
+  Strict（kind + 配方关键维度 + 计数器越界 + 数据集身份）；step_cosine
+  改为喂 epoch 级 n_segments=3 分段余弦表（lr_per_epoch 逃生舱），
+  语义与旧手拼表一致。
+- Go 模型规格：`value_from_spatial`（M10 价值头接线：读盘面特征图 r2
+  vs query 行）从 v1.13 扁平规格的 layer_dims[7] 魔数改为开放规格具名键
+  `value_from_spatial`；旧 spec/断点缺键回退旧接线，权重形状 (1, d) 与
+  (1, d·25) 由该键区分，老文件保持可加载。
+
+### Added
+
+- M10b 价值头诊断埋点（此前躺在 stash，P6 工程债）：
+  - `GoLoss::last_policy_loss()/last_value_loss()` 未加权分项损失；
+  - `GoModel::debug_grad_norms()` 按参数组的梯度 L2 范数
+    （embeddings/conv1/conv2/blocks/ln_f/policy_head/value_head/value_norm/cnn_policy）；
+  - `go_train_cli --grad-debug N`：每 N 个 optimizer step 写
+    `<metrics>.grads.jsonl`（分组梯度 + 分项损失，clip 前钩子）；
+  - 评估/训练指标新增 policy_loss/value_loss 分项；
+  - 回归门 `test_value_head_routing`：价值头接线的梯度去向断言
+    （spatial 探针不得回流 trunk；legacy 必须走 query）。
+- P2 结案修复：go_model_tests 三处 `(size_t 表达式) - 正数` 无符号下溢
+  （真根因——测试数据构造产生 1.8e18 垃圾 float，exp 溢出成 inf 污染
+  稀疏 CE；此前误判为上游/工具链 bug）。修复后本机 CPU 测试全绿，
+  「禁止本机 CPU 训练结论入库」限制作废。
+- 上游 issue：TrainState 自定义域子类无注册读回路径
+  （neuralnet.cpp#44）；在此之前 Go 训练状态继续复用 TextTrainState。
+
 - neuralnet.cpp submodule 升级 v1.12.0 → v1.14.1（开放规格 + 训练骨架，RFC 32）：
   - Go 模型规格迁移到 `ModelSpecBase` 扩展点：新增 `GoTransformerSpec`
     （类型名 `GoTransformer`，经 `ModelRegistry` 注册），替代 v1.13 扁平

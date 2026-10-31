@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <any>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -20,7 +21,9 @@
 #include <vector>
 
 #include <neuralnet.cpp/nn.hpp>
+#include <neuralnet.cpp/batch_source.hpp>    // IndexedBatchSource（RFC 32 §4）
 #include <neuralnet.cpp/cli/cli_engine_factory.hpp>
+#include <neuralnet.cpp/run_driver.hpp>      // RunDriver（RFC 32 §5）
 #include <neuralnet.cpp/core_file.hpp>       // nn::sha256_file_hex（数据集身份）
 #include <neuralnet.cpp/train_state.hpp>     // nn::TrainState（M5 断点状态段）
 #include <neuralnet.cpp/lr_scheduler.hpp>    // nn::compute_epoch_lr
@@ -57,6 +60,10 @@ struct TrainOptions {
     std::string metrics_out = "artifacts/m4/c-validator.json";
     std::string metrics_log;   // 空 = 从 metrics_out 派生（.json → .jsonl）
     std::string resume;        // 非空 = 从 .nnckpt 断点续训
+    // M10b 诊断：>0 = 每 N 个 optimizer step 把分组梯度 L2 范数 + 分项损失
+    // 追加写进 <metrics_log>.grads.jsonl（价值头梯度埋点，判"梯度断/信号弱"）。
+    int grad_debug = 0;
+    std::string grad_debug_log;  // 空 = 从 metrics_log 派生（.jsonl → .grads.jsonl）
     // M7：架构选择。b = B 双分支编码器（默认，主线）；c = M4 CNN 验证器
     // （保留用于 B vs C 对照与 M5 语义回归）。续训时以断点 spec 为权威。
     std::string arch = "b";
@@ -93,6 +100,10 @@ struct EvalMetrics {
     std::size_t value_samples = 0;
     std::size_t samples = 0;
     double seconds = 0;
+    // M10b 诊断：未加权分项损失。价值 AUC 停滞时单看 combined loss 无法
+    // 区分"策略在降、价值平"——分项直接暴露价值 MSE 是否真的在学。
+    double policy_loss = 0;
+    double value_loss = 0;
 };
 
 struct LoadedBatch {
@@ -176,6 +187,8 @@ TrainOptions parse_train_options(int argc, char** argv) {
             options.metrics_out = option_value(i, argc, argv);
         } else if (arg == "--metrics-log") {
             options.metrics_log = option_value(i, argc, argv);
+        } else if (arg == "--grad-debug") {
+            options.grad_debug = std::stoi(option_value(i, argc, argv));
         } else if (arg == "--resume") {
             options.resume = option_value(i, argc, argv);
         } else if (arg == "--epochs") {
@@ -218,6 +231,9 @@ TrainOptions parse_train_options(int argc, char** argv) {
             options.model_config.history_len = std::stoull(option_value(i, argc, argv));
         } else if (arg == "--cnn-policy") {
             options.model_config.cnn_policy = std::stoi(option_value(i, argc, argv)) != 0;
+        } else if (arg == "--value-spatial") {
+            options.model_config.value_from_spatial =
+                std::stoi(option_value(i, argc, argv)) != 0;
         } else if (arg == "--seed") {
             options.seed = std::stoull(option_value(i, argc, argv));
         } else {
@@ -267,6 +283,9 @@ TrainOptions parse_train_options(int argc, char** argv) {
         options.schedule != "step_cosine") {
         throw std::invalid_argument("schedule must be cosine, constant or step_cosine");
     }
+    if (options.grad_debug < 0) {
+        throw std::invalid_argument("grad-debug must be non-negative");
+    }
     if (options.metrics_log.empty()) {
         options.metrics_log = options.metrics_out;
         const std::string suffix = ".json";
@@ -275,6 +294,16 @@ TrainOptions parse_train_options(int argc, char** argv) {
             options.metrics_log.resize(options.metrics_log.size() - suffix.size());
         }
         options.metrics_log += ".jsonl";
+    }
+    if (options.grad_debug > 0 && options.grad_debug_log.empty()) {
+        options.grad_debug_log = options.metrics_log;
+        const std::string jsonl_suffix = ".jsonl";
+        if (options.grad_debug_log.size() > jsonl_suffix.size() &&
+            options.grad_debug_log.ends_with(jsonl_suffix)) {
+            options.grad_debug_log.resize(
+                options.grad_debug_log.size() - jsonl_suffix.size());
+        }
+        options.grad_debug_log += ".grads.jsonl";
     }
     return options;
 }
@@ -365,13 +394,12 @@ std::size_t feature_count_plus_history(
 // move history and packs it row-major [slot * batch + column] so it can be
 // concatenated onto the planes tensor along the row axis. Value targets are
 // always read (v1 caches carry them too; arch=c simply ignores them).
-LoadedBatch load_batch_planes(
+LoadedBatch load_batch_span(
     go::FeatureCache& cache,
-    const std::vector<std::size_t>& indices,
-    std::size_t first,
-    std::size_t count,
+    std::span<const std::size_t> indices,
     std::size_t history_len = 0
 ) {
+    const std::size_t count = indices.size();
     LoadedBatch result{
         std::vector<Scalar>(cache.feature_count() * count, Scalar{0}),
         history_len > 0
@@ -385,7 +413,7 @@ LoadedBatch load_batch_planes(
     for (std::size_t column = 0; column < count; ++column) {
         go::FeatureSampleMeta metadata;
         cache.read_sample(
-            indices[first + column], sample, &metadata,
+            indices[column], sample, &metadata,
             history_len > 0
                 ? std::span<std::uint16_t>(sample_history)
                 : std::span<std::uint16_t>{}
@@ -400,6 +428,20 @@ LoadedBatch load_batch_planes(
         }
     }
     return result;
+}
+
+LoadedBatch load_batch_planes(
+    go::FeatureCache& cache,
+    const std::vector<std::size_t>& indices,
+    std::size_t first,
+    std::size_t count,
+    std::size_t history_len = 0
+) {
+    return load_batch_span(
+        cache,
+        std::span<const std::size_t>(indices.data() + first, count),
+        history_len
+    );
 }
 
 // Input tensor for the model: planes only (C) or planes + history rows (B).
@@ -444,6 +486,8 @@ EvalMetrics evaluate(
     model.set_training(false);
 
     Scalar loss_sum = 0;
+    Scalar policy_loss_sum = 0;
+    Scalar value_loss_sum = 0;
     std::size_t correct = 0;
     std::size_t correct3 = 0;
     // Value AUC: collect (prediction, target) pairs with a nonzero target, then
@@ -468,9 +512,13 @@ EvalMetrics evaluate(
                 engine, output, std::span<const std::size_t>(labels),
                 std::span<const Scalar>(batch.values)
             ));
+            // 未加权分项：诊断用（价值 MSE 是否在降）。
+            policy_loss_sum += go_loss.last_policy_loss() * static_cast<Scalar>(count);
+            value_loss_sum += go_loss.last_value_loss() * static_cast<Scalar>(count);
         } else {
             loss = NN_UNWRAP(loss_fn.forward_sparse(
                 engine, output, labels, {}, go::policy_class_count));
+            policy_loss_sum += loss * static_cast<Scalar>(count);
         }
         loss_sum += loss * static_cast<Scalar>(count);
 
@@ -594,6 +642,8 @@ EvalMetrics evaluate(
         value_samples,
         indices.size(),
         elapsed,
+        static_cast<double>(policy_loss_sum / static_cast<Scalar>(indices.size())),
+        static_cast<double>(value_loss_sum / static_cast<Scalar>(indices.size())),
     };
 }
 
@@ -606,6 +656,8 @@ json metrics_json(const EvalMetrics& metrics) {
         {"value_samples", metrics.value_samples},
         {"samples", metrics.samples},
         {"seconds", metrics.seconds},
+        {"policy_loss", metrics.policy_loss},
+        {"value_loss", metrics.value_loss},
     };
 }
 
@@ -695,66 +747,35 @@ void load_weights(
     }
 }
 
-// ── M5 断点状态装配 ─────────────────────────────────────────────────────
-// 计数器 = 续训起点；配方 = 曲线形状与优化器身份（续训以断点为权威）；
-// 数据集身份 = .ngf 文件 sha256 + 样本数（内容变了就不存在正确的续训语义）。
-// Go 训练器复用上游 TextTrainState 承载域字段（state_kind="text"）：旧 Go
-// 断点（v1.13 无 state_kind 键）读回即 text kind，且上游工厂不接受自定义
-// kind —— 数据集身份（.ngf sha256 + 样本数）正好落在 DatasetIdentity。
-nn::TextTrainState make_train_state(
+// ── 断点状态装配（v1.14.1：域只填域字段，库负责其余）─────────────────────
+// 计数器 / 优化器 t / recipe 的 TrainingConfig 段（optimizer/lr/decay/beta/
+// 裁剪/累积/精度）全部由 TrainingSession::save_checkpoint 内部同步与派生
+// （fill_recipe）；RunDriver 在断点时机把 epoch/step_in_epoch/global_step/lr
+// 写进状态。域侧只拥有：曲线形状（epochs/调度/warmup/batch_size）与数据集
+// 身份（.ngf sha256 + 样本数 —— 内容变了就不存在正确的续训语义）。
+//
+// Go 训练器复用上游 TextTrainState 承载域字段（state_kind="text"）：上游
+// train_state_from_kv 工厂硬编码只认 text kind，自定义 kind 的断点写了读不
+// 回来（自定义域注册表缺失，已报上游 issue neuralnet.cpp#44）。DatasetIdentity
+// 正好覆盖 Go 的域字段；待上游补注册表后切换 GoTrainState。
+nn::TextTrainState make_go_state(
     const TrainOptions& options,
-    const nn::TrainingSession& session,
-    std::uint64_t completed_epochs,
-    std::uint64_t global_step_base,
     const std::string& dataset_sha256,
     std::size_t train_samples
 ) {
     nn::TextTrainState state;
-    state.counters.global_step = global_step_base + session.step_count();
-    state.counters.epoch = completed_epochs;
-    state.counters.step_in_epoch = 0;  // 断点只写在 epoch 边界
-    state.counters.lr = static_cast<double>(session.current_lr());
-
-    state.recipe.optimizer = options.optimizer;
     state.recipe.lr_schedule = options.schedule;
-    state.recipe.lr = static_cast<double>(options.lr);
-    state.recipe.min_lr = static_cast<double>(options.min_lr);
-    state.recipe.weight_decay = static_cast<double>(options.weight_decay);
-    state.recipe.beta1 = static_cast<double>(options.beta1);
-    state.recipe.beta2 = static_cast<double>(options.beta2);
-    state.recipe.max_norm = static_cast<double>(options.clip_grad_norm);
     state.recipe.epochs = static_cast<std::uint64_t>(options.epochs);
     state.recipe.warmup_epochs = static_cast<std::uint64_t>(options.warmup_epochs);
     state.recipe.batch_size = options.common.batch_size;
     state.recipe.micro_batch_size = options.common.batch_size;
     state.recipe.batch_size_is_global = true;
-    state.recipe.accum_steps = 1;
-
     state.dataset.path = options.dataset;
     state.dataset.sha256 = dataset_sha256;
     state.dataset.num_samples = train_samples;
     state.dataset.steps_per_epoch =
         (train_samples + options.common.batch_size - 1) / options.common.batch_size;
-
-    state.optimizer_step = session.state().optimizer_step;
     return state;
-}
-
-// 断点保存：模型参数（Checkpoint 角色）+ 训练状态段 + 优化器状态张量。
-void save_checkpoint_file(
-    const std::string& path,
-    nn::Model& model,
-    const nn::ModelSpec& spec,
-    const nn::TrainState& state,
-    nn::Optimizer& optimizer
-) {
-    std::vector<nn::Tensor> blobs;
-    NN_UNWRAP(optimizer.save_state(blobs));
-    // save_model 内部 clone 状态并回写 optimizer_blob_count，调用方只给只读引用。
-    const nn::CheckpointState ckpt{&state, std::span<const nn::Tensor>(blobs)};
-    NN_UNWRAP(nn::save_model(
-        path, model, spec, {}, nn::ModelRole::Checkpoint, ckpt
-    ));
 }
 
 int inspect_cache(const std::string& path) {
@@ -818,58 +839,16 @@ int train(const TrainOptions& options) {
 
     nn::ModelSpec spec;
     std::unique_ptr<nn::Model> model;
-    std::optional<nn::LoadedTrainState> resumed;
-    std::uint64_t global_step_base = 0;
+    const bool resumed = !options.resume.empty();
     int start_epoch = 0;
 
-    if (!options.resume.empty()) {
-        // ── 断点续训：状态段为唯一权威 ────────────────────────────────
-        nn::LoadedTrainState loaded = NN_UNWRAP(nn::load_train_state(engine, options.resume));
-        const auto* saved = dynamic_cast<const nn::TextTrainState*>(loaded.state.get());
-        if (saved == nullptr) {
-            throw std::runtime_error(
-                std::string("--resume 的训练状态段不是 Go 训练器可识别的类型（kind=") +
-                loaded.state->state_kind() + "）: " + options.resume
-            );
-        }
-
-        // 数据集身份门禁（硬错）：sha256 或样本数变了 ⇒ step 号 / lr 曲线
-        // 语义全变，续训不存在正确出口。
-        if (saved->dataset.sha256 != dataset_sha256 ||
-            saved->dataset.num_samples != train_cache.size()) {
-            throw std::runtime_error(
-                std::string("--resume 的数据集与断点不一致（内容身份变了 ⇒ 续训不存在正确语义）:\n") +
-                "  断点记录 sha256=" + saved->dataset.sha256 +
-                " samples=" + std::to_string(saved->dataset.num_samples) + "\n" +
-                "  本次     sha256=" + dataset_sha256 +
-                " samples=" + std::to_string(train_cache.size()) + "\n" +
-                "  断点文件: " + options.resume + "\n" +
-                "  换数据集 = 新任务 ⇒ 请从推理模型（.nnmodel）重开一轮"
-            );
-        }
-        if (saved->recipe.epochs != static_cast<std::uint64_t>(options.epochs)) {
-            throw std::runtime_error(
-                "--epochs 与断点配方不一致（lr 曲线形状必须跨续训不变）: 断点 epochs=" +
-                std::to_string(saved->recipe.epochs) + "，本次 --epochs " +
-                std::to_string(options.epochs)
-            );
-        }
-        if (saved->recipe.accum_steps != 1) {
-            throw std::runtime_error("本训练器只支持 accum_steps=1 的断点");
-        }
-        if (saved->counters.epoch > static_cast<std::uint64_t>(options.epochs)) {
-            throw std::runtime_error(
-                "断点已训完 " + std::to_string(saved->counters.epoch) +
-                " 个 epoch，超过 --epochs " + std::to_string(options.epochs) +
-                "，没有可续的训练"
-            );
-        }
-
+    if (resumed) {
+        // ── 断点续训：状态段为唯一权威（v1.14.1：权重载入交给
+        // session.resume，校验先行、无半提交；优化器 t 取权威值）──────
         const nn::ModelSpec file_spec = NN_UNWRAP(go::peek_go_model_spec(options.resume));
         model = std::make_unique<nn::Model>(
             NN_UNWRAP(go::build_project_model_from_spec(engine, file_spec))
         );
-        load_weights(options.resume, *model, nn::WeightLoadIntent::Trainable);
         spec = file_spec;
         // Derive the effective architecture from the checkpoint spec so the
         // data path (history rows, loss) matches what the weights expect.
@@ -884,20 +863,6 @@ int train(const TrainOptions& options) {
             // 续训的 K 由断点 spec 决定（--history-len 不参与），缓存必须匹配。
             require_history_k(history_len);
         }
-
-        global_step_base = saved->counters.global_step;
-        start_epoch = static_cast<int>(saved->counters.epoch);
-        const std::size_t optimizer_tensors = loaded.optimizer_blobs.size();
-        const std::uint64_t optimizer_step = saved->optimizer_step;
-        const std::string optimizer_name = saved->recipe.optimizer;
-        resumed = std::move(loaded);
-        std::cerr << "resumed from " << options.resume
-                  << ": epoch=" << start_epoch
-                  << " global_step=" << global_step_base
-                  << " optimizer=" << optimizer_name
-                  << " optimizer_step=" << optimizer_step
-                  << " optimizer_tensors=" << optimizer_tensors
-                  << '\n';
     } else if (options.arch == "b") {
         spec = go::make_go_spec(options.model_config);
         model = std::make_unique<nn::Model>(
@@ -916,27 +881,11 @@ int train(const TrainOptions& options) {
     }
     model->set_training(true);
 
-    const EvalMetrics initial_eval = evaluate(
-        *model, eval_cache, options.common.batch_size, 0, history_len,
-        options.value_weight
-    );
-    model->set_training(true);
-
-    // Baseline for the loss-decline gate: the untrained model's loss on the
-    // *training* set. It must be measured before the model is moved into the
-    // TrainingSession below, and it must share a dataset with the final
-    // train_loss — using initial_eval (eval set) as the baseline misjudges a
-    // legitimate single-epoch convergence as a failure.
-    Scalar first_train_loss = initial_eval.loss;
-    const int planned_final_epoch = options.stop_after_epoch > 0
-        ? options.stop_after_epoch
-        : options.epochs;
-    if (planned_final_epoch > start_epoch) {
-        first_train_loss = evaluate(
-            *model, train_cache, options.common.batch_size, kBaselineSamples,
-            history_len, options.value_weight
-        ).loss;
-        model->set_training(true);
+    const std::size_t train_samples = sample_indices(
+        train_cache, options.common.max_samples
+    ).size();
+    if (train_samples == 0) {
+        throw std::runtime_error("training cache has no samples");
     }
 
     nn::TrainingConfig training_config;
@@ -950,59 +899,326 @@ int train(const TrainOptions& options) {
     nn::TrainingSession session = NN_UNWRAP(
         nn::TrainingSession::create(std::move(*model), training_config)
     );
-    nn::CrossEntropyLoss loss_fn;
-    go::GoLoss go_loss(options.value_weight);
+
+    // 域状态：曲线形状 + 数据集身份。优化器/精度/TrainingConfig 段由
+    // session.save_checkpoint 的 fill_recipe 派生；计数器由 RunDriver 同步。
+    nn::TextTrainState domain_state = make_go_state(
+        options, dataset_sha256, train_samples
+    );
 
     if (resumed) {
-        // 优化器身份已由状态段决定；张量数量/形状对不上由 load_state 硬错。
-        session.optimizer().set_state_step(resumed->state->optimizer_step);
-        NN_UNWRAP(session.optimizer().load_state(resumed->optimizer_blobs));
-        std::cerr << "restored optimizer state: "
-                  << resumed->optimizer_blobs.size() << " tensors\n";
+        // 库口径续训（Strict）：kind + 配方关键维度（optimizer/调度/epochs/
+        // warmup/batch/accum/精度）+ 计数器不越界 + 域级 verify_extra
+        //（TextTrainState = 数据集 sha256/样本数）。校验通过后才载入权重
+        //（v1.14.1 无半提交），优化器 t 取权威值。
+        session.fill_recipe(domain_state.recipe);
+        std::unique_ptr<nn::TrainState> loaded = NN_UNWRAP(
+            session.resume(options.resume, &domain_state, nn::ResumePolicy::Strict)
+        );
+        const auto* saved = dynamic_cast<const nn::TextTrainState*>(loaded.get());
+        if (saved == nullptr) {
+            throw std::runtime_error(
+                std::string("--resume 的训练状态段不是 Go 训练器可识别的类型（kind=") +
+                loaded->state_kind() + "）: " + options.resume
+            );
+        }
+        start_epoch = static_cast<int>(saved->counters.epoch);
+        std::cerr << "resumed from " << options.resume
+                  << ": epoch=" << start_epoch
+                  << " global_step=" << loaded->counters.global_step
+                  << " optimizer=" << saved->recipe.optimizer
+                  << " optimizer_step=" << saved->optimizer_step
+                  << '\n';
+        // RunDriver 从断点计数器继续（epoch/step_in_epoch）；域字段随状态走。
+        domain_state = *static_cast<nn::TextTrainState*>(loaded.get());
     }
 
-    std::vector<std::size_t> indices = sample_indices(
-        train_cache, options.common.max_samples
+    // 初始评估（续训 = 断点权重建模）+ 损失下降门槛的未训练基线。
+    EvalMetrics initial_eval = evaluate(
+        session.model(), eval_cache, options.common.batch_size, 0, history_len,
+        options.value_weight
     );
-    if (indices.empty()) {
-        throw std::runtime_error("training cache has no samples");
-    }
-    nn::LrScheduleConfig lr_config;
-    lr_config.base_lr = options.lr;
-    lr_config.min_lr = options.min_lr;
-    lr_config.total_epochs = options.epochs;
-    lr_config.warmup_epochs = options.warmup_epochs;
-    lr_config.schedule = options.schedule;
-    if (options.schedule == "step_cosine") {
-        // 库只提供 constant/cosine，这里用 lr_per_epoch 表达"三段余弦 + 重启"
-        // （SGDR 口径）：每段内余弦从 base_lr 退到 min_lr，段边界重启；
-        // warmup 作用在第一段。段数 = 3（可被 --epochs 截断）。
-        const int segments = 3;
-        const int per_segment = std::max(1, options.epochs / segments);
-        std::vector<Scalar> table(static_cast<std::size_t>(options.epochs));
-        for (int epoch = 0; epoch < options.epochs; ++epoch) {
-            const int local = epoch % per_segment;
-            const Scalar progress =
-                static_cast<Scalar>(local) / static_cast<Scalar>(per_segment);
-            const Scalar cosine =
-                Scalar{0.5} * (Scalar{1} + std::cos(static_cast<Scalar>(3.14159265358979323846) * progress));
-            table[static_cast<std::size_t>(epoch)] =
-                options.min_lr + (options.lr - options.min_lr) * cosine;
-        }
-        if (options.warmup_epochs > 0) {
-            for (int epoch = 0; epoch < options.warmup_epochs && epoch < options.epochs; ++epoch) {
-                table[static_cast<std::size_t>(epoch)] =
-                    options.lr * static_cast<Scalar>(epoch + 1) /
-                    static_cast<Scalar>(options.warmup_epochs);
-            }
-        }
-        lr_config.lr_per_epoch = std::move(table);
-        lr_config.schedule = "constant";  // 表优先；显式写明不留歧义
-    }
+    session.model().set_training(true);
 
-    const int final_epoch = options.stop_after_epoch > 0
+    Scalar first_train_loss = initial_eval.loss;
+    const int planned_final_epoch = options.stop_after_epoch > 0
         ? options.stop_after_epoch
         : options.epochs;
+    if (planned_final_epoch > start_epoch) {
+        // 基线必须与最终 train_loss 同数据集（用 eval 集当基线会把合法的
+        // 单轮收敛误判成失败）。
+        first_train_loss = evaluate(
+            session.model(), train_cache, options.common.batch_size, kBaselineSamples,
+            history_len, options.value_weight
+        ).loss;
+        session.model().set_training(true);
+    }
+
+    // ── 数据供给（IndexedBatchSource：epoch 网格 + 单流重放 shuffle）─────
+    // shuffle 语义 = 库口径（恒等序起、单 RNG 依次重放 epoch+1 次），与
+    // 旧 CLI 的 (seed,epoch) 独立播种不同：旧 checkpoint 不承诺数据序兼容
+    //（本项目决定不回续旧断点，M10b 停在 epoch 2 的断点只当只读权重）。
+    struct GoBatchPayload {
+        nn::Tensor input;
+        std::vector<std::size_t> labels;
+        std::vector<Scalar> values;
+    };
+    const std::size_t input_rows = feature_count_plus_history(train_cache, history_len);
+    auto assemble = [&](std::span<const std::size_t> indices)
+        -> nn::Result<std::pair<std::any, std::size_t>> {
+        const std::size_t count = indices.size();
+        LoadedBatch batch = load_batch_span(train_cache, indices, history_len);
+        nn::Tensor input = engine.create_tensor(input_rows, count);
+        if (!input.valid()) {
+            NN_FAIL("cannot allocate training input tensor");
+        }
+        write_model_input(
+            engine, input, batch, train_cache.feature_count(), count, history_len
+        );
+        GoBatchPayload payload{
+            std::move(input), std::move(batch.labels), std::move(batch.values)
+        };
+        return std::make_pair(std::any(std::move(payload)), count);
+    };
+    auto source_result = nn::IndexedBatchSource::create(
+        train_samples, options.common.batch_size, options.seed, std::move(assemble)
+    );
+    if (!source_result) {
+        throw std::runtime_error(
+            "cannot create batch source: " + source_result.error().message
+        );
+    }
+    nn::IndexedBatchSource source = std::move(*source_result);
+
+    // ── lr 调度（v1.14.1：库原生；step_cosine 用 epoch 级分段余弦表）────
+    nn::RunDriverConfig driver_config;
+    driver_config.epochs = options.epochs;
+    driver_config.stop_after_epoch = options.stop_after_epoch;
+    driver_config.lr = options.lr;
+    driver_config.min_lr = options.min_lr;
+    driver_config.warmup_epochs = options.warmup_epochs;
+    if (options.schedule == "step_cosine") {
+        // 3 段 SGDR：段内余弦退火 + 段末重启。上游 epoch 级 step_cosine
+        // （issue #31）与旧手拼表同语义，经 lr_per_epoch 逃生舱喂给 driver
+        //（RunDriver 把字符串 "step_cosine" 解释成 step 级，不能直接传）。
+        nn::LrScheduleConfig segments;
+        segments.base_lr = options.lr;
+        segments.min_lr = options.min_lr;
+        segments.total_epochs = options.epochs;
+        segments.warmup_epochs = options.warmup_epochs;
+        segments.schedule = "step_cosine";
+        segments.n_segments = 3;
+        for (int epoch = 0; epoch < options.epochs; ++epoch) {
+            driver_config.lr_per_epoch.push_back(
+                nn::compute_epoch_lr(segments, epoch));
+        }
+        driver_config.lr_schedule = "fixed";  // 表优先；显式写明不留歧义
+    } else {
+        driver_config.lr_schedule =
+            options.schedule == "constant" ? "fixed" : options.schedule;
+    }
+    driver_config.save_interval = 0;  // epoch 边界断点（崩溃最多丢一个 epoch）
+
+    // ── 钩子：do_update / evaluate / on_epoch_end / on_checkpoint ────────
+    go::GoLoss go_loss(options.value_weight);
+    nn::CrossEntropyLoss loss_fn;
+
+    EvalMetrics final_eval = initial_eval;
+    Scalar final_train_loss = 0;
+    json history = json::array();
+    Scalar epoch_loss_sum = 0;
+    Scalar epoch_policy_sum = 0;
+    Scalar epoch_value_sum = 0;
+    std::size_t epoch_seen = 0;
+    std::size_t epoch_index = 0;
+    std::uint64_t last_global_step = 0;
+    auto epoch_started = std::chrono::steady_clock::now();
+
+    nn::RunHooks hooks;
+    hooks.do_update = [&](nn::TrainingSession& s, const nn::UpdateRequest& req)
+        -> nn::Result<nn::UpdateOutcome> {
+        if (req.epoch != epoch_index || req.step == 0) {
+            epoch_index = req.epoch;
+            epoch_loss_sum = 0;
+            epoch_policy_sum = 0;
+            epoch_value_sum = 0;
+            epoch_seen = 0;
+            epoch_started = std::chrono::steady_clock::now();
+        }
+        last_global_step = req.global_step;
+        NN_TRY(at_r, source.next(req.step));
+        const std::size_t count = at_r->samples;
+        auto* payload = std::any_cast<GoBatchPayload>(&at_r->payload);
+        if (payload == nullptr) {
+            NN_FAIL("batch payload 类型错误（GoBatchPayload）");
+        }
+
+        Scalar batch_loss = 0;
+        nn::TrainingStepOptions step_options;
+        step_options.lr = req.lr;
+        step_options.clip_grad_norm = options.clip_grad_norm;
+        step_options.normalization_units = at_r->units;
+        // M10b 价值梯度埋点：clip 前的 hook——每 N 个 optimizer step 把
+        // 分组梯度 L2 + 本批分项损失写进 .grads.jsonl（低频：逐张量
+        // 读回宿主有同步开销，grad-debug=0 时零开销）。
+        if (options.grad_debug > 0 &&
+            (s.step_count() % static_cast<std::uint64_t>(options.grad_debug)) == 0) {
+            step_options.before_update = [&]() -> nn::Result<bool> {
+                json record = {
+                    {"record", "grad_debug"},
+                    {"epoch", req.epoch + 1},
+                    {"step", static_cast<std::uint64_t>(s.step_count())},
+                    {"policy_loss", static_cast<double>(go_loss.last_policy_loss())},
+                    {"value_loss", static_cast<double>(go_loss.last_value_loss())},
+                };
+                nn::Layer& root = s.model().layer_at(0);
+                if (std::string_view(root.layer_name()) == "GoModel") {
+                    auto* go_model = static_cast<go::GoModel*>(&root);
+                    auto norms = go_model->debug_grad_norms();
+                    if (norms) {
+                        json grads = json::object();
+                        for (const auto& [name, value] : *norms) {
+                            grads[name] = value;
+                        }
+                        record["grad_l2"] = grads;
+                    } else {
+                        record["grad_error"] = norms.error().message;
+                    }
+                }
+                append_metrics_log(options.grad_debug_log, record);
+                return nn::Result<bool>(false);
+            };
+        }
+        auto step_report = s.train_step(
+            payload->input,
+            step_options,
+            [&](nn::Model& current, nn::ComputeEngine& current_engine,
+                const nn::Tensor& batch_input) -> nn::Result<nn::TrainingStepOutput> {
+                auto output = current.forward(batch_input);
+                NN_TRY_CHECK(output);
+                Scalar loss_value = 0;
+                nn::Result<nn::Tensor> gradient{};
+                if (history_len > 0) {
+                    // B: dual-head loss. Policy CE over rows 0..361 +
+                    // value MSE over row 362, combined into one grad.
+                    auto loss = go_loss.forward(
+                        current_engine, *output,
+                        std::span<const std::size_t>(payload->labels),
+                        std::span<const Scalar>(payload->values)
+                    );
+                    NN_TRY_CHECK(loss);
+                    loss_value = *loss;
+                    gradient = go_loss.backward();
+                } else {
+                    // C: policy-only cross-entropy (M4/M5 semantics).
+                    auto loss = loss_fn.forward_sparse(
+                        current_engine, *output, payload->labels, {},
+                        go::policy_class_count
+                    );
+                    NN_TRY_CHECK(loss);
+                    loss_value = *loss;
+                    gradient = loss_fn.backward();
+                }
+                NN_TRY_CHECK(gradient);
+                batch_loss = loss_value;
+                nn::TrainingStepOutput result;
+                result.grad = std::move(*gradient);
+                result.gradient_units = count;
+                return result;
+            }
+        );
+        NN_TRY_CHECK(step_report);
+        epoch_loss_sum += batch_loss * static_cast<Scalar>(count);
+        if (history_len > 0) {
+            epoch_policy_sum += go_loss.last_policy_loss() * static_cast<Scalar>(count);
+            epoch_value_sum += go_loss.last_value_loss() * static_cast<Scalar>(count);
+        } else {
+            epoch_policy_sum += batch_loss * static_cast<Scalar>(count);
+        }
+        epoch_seen += count;
+
+        nn::UpdateOutcome outcome;
+        outcome.parameters_updated = step_report->parameters_updated;
+        outcome.samples = count;
+        outcome.loss = batch_loss;
+        outcome.has_loss = true;
+        return outcome;
+    };
+    hooks.evaluate = [&](nn::TrainingSession& s, std::size_t epoch)
+        -> nn::Result<Scalar> {
+        (void)epoch;
+        final_eval = evaluate(
+            s.model(), eval_cache, options.common.batch_size, 0, history_len,
+            options.value_weight
+        );
+        s.model().set_training(true);
+        return final_eval.loss;
+    };
+    hooks.on_epoch_end = [&](const nn::RunReport& report, std::size_t epoch)
+        -> nn::Result<void> {
+        const Scalar mean_loss = epoch_seen > 0
+            ? epoch_loss_sum / static_cast<Scalar>(epoch_seen)
+            : Scalar{0};
+        final_train_loss = mean_loss;
+        const Scalar seen = epoch_seen > 0 ? static_cast<Scalar>(epoch_seen) : Scalar{1};
+        const double train_policy_loss =
+            static_cast<double>(epoch_policy_sum / seen);
+        const double train_value_loss =
+            static_cast<double>(epoch_value_sum / seen);
+        const double epoch_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - epoch_started
+        ).count();
+        history.push_back({
+            {"epoch", epoch + 1},
+            {"lr", static_cast<double>(report.final_lr)},
+            {"train_loss", static_cast<double>(mean_loss)},
+            {"train_policy_loss", train_policy_loss},
+            {"train_value_loss", train_value_loss},
+            {"eval", metrics_json(final_eval)},
+            {"seconds", epoch_seconds},
+        });
+        append_metrics_log(options.metrics_log, {
+            {"record", "epoch"},
+            {"epoch", epoch + 1},
+            {"lr", static_cast<double>(report.final_lr)},
+            {"train_loss", static_cast<double>(mean_loss)},
+            {"train_policy_loss", train_policy_loss},
+            {"train_value_loss", train_value_loss},
+            {"eval", metrics_json(final_eval)},
+            {"seconds", epoch_seconds},
+            {"global_step", last_global_step},
+        });
+        std::cerr << "epoch " << (epoch + 1) << '/' << options.epochs
+                  << " train_loss=" << static_cast<double>(mean_loss)
+                  << " policy_loss=" << train_policy_loss
+                  << " value_loss=" << train_value_loss
+                  << " eval_loss=" << static_cast<double>(final_eval.loss)
+                  << " top1=" << final_eval.top1
+                  << " top3=" << final_eval.top3
+                  << " value_auc=" << final_eval.value_auc
+                  << " seconds=" << epoch_seconds << '\n';
+        return {};
+    };
+    hooks.on_checkpoint = [&](nn::TrainingSession& s, const nn::TrainState& state)
+        -> nn::Result<void> {
+        // 驱动已同步 epoch/step_in_epoch/global_step/lr；域字段随状态走；
+        // save_checkpoint 再派生 TrainingConfig 段并导出优化器状态。
+        std::unique_ptr<nn::TrainState> snapshot = state.clone();
+        std::filesystem::create_directories(
+            std::filesystem::path(options.checkpoint).parent_path()
+        );
+        return s.save_checkpoint(options.checkpoint, spec, *snapshot);
+    };
+
+    auto driver = nn::RunDriver::create(
+        session, source,
+        std::make_unique<nn::TextTrainState>(domain_state),
+        std::move(driver_config)
+    );
+    if (!driver) {
+        throw std::runtime_error("cannot create run driver: " + driver.error().message);
+    }
+    driver->set_hooks(std::move(hooks));
 
     append_metrics_log(options.metrics_log, {
         {"record", "run"},
@@ -1016,7 +1232,7 @@ int train(const TrainOptions& options) {
         {"seed", options.seed},
         {"epochs", options.epochs},
         {"start_epoch", start_epoch},
-        {"stop_after_epoch", final_epoch},
+        {"stop_after_epoch", planned_final_epoch},
         {"batch_size", options.common.batch_size},
         {"optimizer", options.optimizer},
         {"schedule", options.schedule},
@@ -1027,148 +1243,15 @@ int train(const TrainOptions& options) {
         {"beta2", static_cast<double>(options.beta2)},
         {"clip_grad_norm", static_cast<double>(options.clip_grad_norm)},
         {"warmup_epochs", options.warmup_epochs},
-        {"train_samples", indices.size()},
+        {"train_samples", train_samples},
         {"initial_eval", metrics_json(initial_eval)},
     });
 
     const auto training_started = std::chrono::steady_clock::now();
-    json history = json::array();
-    EvalMetrics final_eval = initial_eval;
-    Scalar final_train_loss = 0;
+    nn::RunReport run_report = NN_UNWRAP(driver->fit());
+    const int final_epoch = static_cast<int>(run_report.final_epoch);
 
-    for (int epoch = start_epoch; epoch < final_epoch; ++epoch) {
-        const Scalar epoch_lr = nn::compute_epoch_lr(lr_config, epoch);
-        session.set_lr(epoch_lr);
-        // 洗牌序是 (seed, epoch) 的纯函数：每 epoch 先还原成自然序再用该
-        // epoch 派生的 RNG 洗牌（std::shuffle 的输出依赖输入序，若沿用上一
-        // epoch 的排列，续训进程与一口气训练在同一 epoch 会得到不同数据序）。
-        // 这是"续训无损"的前提之一。
-        std::iota(indices.begin(), indices.end(), std::size_t{0});
-        std::mt19937_64 epoch_rng(
-            options.seed ^ (0x9E3779B97F4A7C15ull * static_cast<std::uint64_t>(epoch + 1))
-        );
-        std::shuffle(indices.begin(), indices.end(), epoch_rng);
-        const auto epoch_started = std::chrono::steady_clock::now();
-        Scalar loss_sum = 0;
-        std::size_t seen = 0;
-
-        for (std::size_t first = 0; first < indices.size();
-             first += options.common.batch_size) {
-            const std::size_t count =
-                std::min(options.common.batch_size, indices.size() - first);
-            LoadedBatch batch = load_batch_planes(
-                train_cache, indices, first, count, history_len
-            );
-            nn::Tensor input = engine.create_tensor(
-                feature_count_plus_history(train_cache, history_len), count);
-            if (!input.valid()) {
-                throw std::runtime_error("cannot allocate training input tensor");
-            }
-            write_model_input(
-                engine, input, batch, train_cache.feature_count(), count, history_len);
-            const std::vector<std::size_t>& labels = batch.labels;
-            const std::vector<Scalar>& values = batch.values;
-
-            Scalar batch_loss = 0;
-            nn::TrainingStepOptions step_options;
-            step_options.lr = epoch_lr;
-            step_options.clip_grad_norm = options.clip_grad_norm;
-            step_options.normalization_units = count;
-            auto step_report = NN_UNWRAP(session.train_step(
-                input,
-                step_options,
-                [&](nn::Model& current, nn::ComputeEngine& current_engine,
-                    const nn::Tensor& batch_input) -> nn::Result<nn::TrainingStepOutput> {
-                    auto output = current.forward(batch_input);
-                    NN_TRY_CHECK(output);
-                    Scalar loss_value = 0;
-                    nn::Result<nn::Tensor> gradient{};
-                    if (history_len > 0) {
-                        // B: dual-head loss. Policy CE over rows 0..361 +
-                        // value MSE over row 362, combined into one grad.
-                        auto loss = go_loss.forward(
-                            current_engine, *output,
-                            std::span<const std::size_t>(labels),
-                            std::span<const Scalar>(values)
-                        );
-                        NN_TRY_CHECK(loss);
-                        loss_value = *loss;
-                        gradient = go_loss.backward();
-                    } else {
-                        // C: policy-only cross-entropy (M4/M5 semantics).
-                        auto loss = loss_fn.forward_sparse(
-                            current_engine, *output, labels, {},
-                            go::policy_class_count
-                        );
-                        NN_TRY_CHECK(loss);
-                        loss_value = *loss;
-                        gradient = loss_fn.backward();
-                    }
-                    NN_TRY_CHECK(gradient);
-                    batch_loss = loss_value;
-                    nn::TrainingStepOutput result;
-                    result.grad = std::move(*gradient);
-                    result.gradient_units = count;
-                    return result;
-                }
-            ));
-            (void)step_report;
-            loss_sum += batch_loss * static_cast<Scalar>(count);
-            seen += count;
-        }
-
-        const Scalar mean_loss = loss_sum / static_cast<Scalar>(seen);
-        final_train_loss = mean_loss;
-        const EvalMetrics eval = evaluate(
-            session.model(), eval_cache, options.common.batch_size, 0, history_len,
-            options.value_weight
-        );
-        final_eval = eval;
-        session.model().set_training(true);
-        const double epoch_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - epoch_started
-        ).count();
-        const std::uint64_t completed = static_cast<std::uint64_t>(epoch + 1);
-        history.push_back({
-            {"epoch", epoch + 1},
-            {"lr", static_cast<double>(epoch_lr)},
-            {"train_loss", static_cast<double>(mean_loss)},
-            {"eval", metrics_json(eval)},
-            {"seconds", epoch_seconds},
-        });
-        append_metrics_log(options.metrics_log, {
-            {"record", "epoch"},
-            {"epoch", epoch + 1},
-            {"lr", static_cast<double>(epoch_lr)},
-            {"train_loss", static_cast<double>(mean_loss)},
-            {"eval", metrics_json(eval)},
-            {"seconds", epoch_seconds},
-            {"global_step", global_step_base + session.step_count()},
-        });
-        std::cerr << "epoch " << (epoch + 1) << '/' << options.epochs
-                  << " train_loss=" << static_cast<double>(mean_loss)
-                  << " eval_loss=" << static_cast<double>(eval.loss)
-                  << " top1=" << eval.top1
-                  << " top3=" << eval.top3
-                  << " value_auc=" << eval.value_auc
-                  << " seconds=" << epoch_seconds << '\n';
-
-        // epoch 边界存档：断点永远是"可续点"，崩溃最多丢一个 epoch。
-        std::filesystem::create_directories(
-            std::filesystem::path(options.checkpoint).parent_path()
-        );
-        save_checkpoint_file(
-            options.checkpoint,
-            session.model(),
-            spec,
-            make_train_state(
-                options, session, completed, global_step_base,
-                dataset_sha256, indices.size()
-            ),
-            session.optimizer()
-        );
-    }
-
+    // ── 收尾：最终断点 + 推理模型 + 往返验证 ────────────────────────────
     session.model().set_training(false);
     std::filesystem::create_directories(
         std::filesystem::path(options.checkpoint).parent_path()
@@ -1176,16 +1259,17 @@ int train(const TrainOptions& options) {
     std::filesystem::create_directories(
         std::filesystem::path(options.model).parent_path()
     );
-    save_checkpoint_file(
-        options.checkpoint,
-        session.model(),
-        spec,
-        make_train_state(
-            options, session, static_cast<std::uint64_t>(final_epoch),
-            global_step_base, dataset_sha256, indices.size()
-        ),
-        session.optimizer()
-    );
+    {
+        nn::TextTrainState final_state = make_go_state(
+            options, dataset_sha256, train_samples
+        );
+        // fit 的停止位置（"下一步"语义，epoch 边界已归一化）。
+        final_state.counters.epoch = run_report.final_epoch;
+        final_state.counters.step_in_epoch = run_report.final_step_in_epoch;
+        final_state.counters.global_step = last_global_step;
+        final_state.counters.lr = static_cast<double>(run_report.final_lr);
+        NN_UNWRAP(session.save_checkpoint(options.checkpoint, spec, final_state));
+    }
     NN_UNWRAP(nn::save_model(options.model, session.model(), spec));
 
     const nn::ModelSpec loaded_checkpoint_spec =
@@ -1241,7 +1325,7 @@ int train(const TrainOptions& options) {
         {"seed", options.seed},
         {"epochs", options.epochs},
         {"start_epoch", start_epoch},
-        {"stop_after_epoch", final_epoch},
+        {"stop_after_epoch", planned_final_epoch},
         {"batch_size", options.common.batch_size},
         {"optimizer", options.optimizer},
         {"schedule", options.schedule},
@@ -1252,9 +1336,9 @@ int train(const TrainOptions& options) {
         {"beta2", static_cast<double>(options.beta2)},
         {"clip_grad_norm", static_cast<double>(options.clip_grad_norm)},
         {"warmup_epochs", options.warmup_epochs},
-        {"train_samples", indices.size()},
+        {"train_samples", train_samples},
         {"eval_samples", eval_cache.size()},
-        {"global_step", global_step_base + session.step_count()},
+        {"global_step", last_global_step},
         {"initial_eval", metrics_json(initial_eval)},
         {"history", std::move(history)},
         {"checkpoint", {
@@ -1282,7 +1366,7 @@ int train(const TrainOptions& options) {
         {"eval", metrics_json(final_eval)},
         {"checkpoint_max_logit_diff", checkpoint_diff},
         {"model_max_logit_diff", model_diff},
-        {"global_step", global_step_base + session.step_count()},
+        {"global_step", last_global_step},
         {"seconds", total_seconds},
     });
     std::cout << report.dump(2) << '\n';
@@ -1325,6 +1409,9 @@ MakeModelOptions parse_make_model_options(int argc, char** argv) {
             options.model_config.history_len = std::stoull(option_value(i, argc, argv));
         } else if (arg == "--cnn-policy") {
             options.model_config.cnn_policy = std::stoi(option_value(i, argc, argv)) != 0;
+        } else if (arg == "--value-spatial") {
+            options.model_config.value_from_spatial =
+                std::stoi(option_value(i, argc, argv)) != 0;
         } else {
             throw std::invalid_argument("unknown make-model option: " + std::string(arg));
         }
