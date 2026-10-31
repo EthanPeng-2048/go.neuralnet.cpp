@@ -26,8 +26,9 @@
 //   序列  (d, batch·T)              T = 25 + K + 1，列序 b·T + t
 //   输出  (363, batch)              0..361 策略 logits，362 = tanh(v)
 //
-// ModelSpec（D6 零补丁）：复用 type=Transformer，用 patch_size 记区域网格、
-// layer_dims[0] 记魔数标记；不引入新 ModelType。
+// ModelSpec：neuralnet.cpp v1.14.1 起使用开放规格扩展点。项目定义
+// GoTransformerSpec（类型名 GoTransformer），并保留对 v1.13 扁平
+// Transformer 规格的只读兼容层。
 
 #include <cstddef>
 #include <cstdint>
@@ -50,7 +51,7 @@ inline constexpr std::uint16_t history_pad_token = 365;           // <pad>
 inline constexpr std::size_t segment_count = 3;                   // 盘面 / 历史 / query
 inline constexpr std::size_t packed_output_rows = policy_class_count + 1;  // 363
 inline constexpr std::size_t value_row_index = policy_class_count;          // 362
-// D6 零补丁标记："GoM1"，写进 spec.layer_dims[0] 用来把 Go 模型与普通 ViT 区分开。
+// v1.13 及更早文件的 "GoM1" 魔数，位于 layer_dims[0]；仅用于只读迁移识别。
 inline constexpr std::uint32_t go_spec_tag = 0x476F4D31u;
 
 // 模型输入行数：9 平面 + K 行历史 id。
@@ -77,10 +78,36 @@ struct GoModelConfig {
     bool cnn_policy = false;
 };
 
-// ── ModelSpec 往返（D6）────────────────────────────────────────────────────
+// neuralnet.cpp v1.14.1 的开放模型规格：类型参数与判别符随 ModelSpecBase
+// 多态对象走。字段顺序沿用 v1.13 的扁平规格布局，便于旧文件只读迁移。
+class GoTransformerSpec final : public nn::ModelSpecBase {
+public:
+    GoModelConfig config;
+
+    [[nodiscard]] const char* type_name() const noexcept override {
+        return "GoTransformer";
+    }
+    [[nodiscard]] std::unique_ptr<nn::ModelSpecBase> clone() const override;
+    [[nodiscard]] bool arch_compatible(
+        const nn::ModelSpecBase& other
+    ) const override;
+    [[nodiscard]] std::string summary(const nn::ModelSpec& shell) const override;
+    void write_kv(nn::KeyValueRecord& kv) const override;
+    [[nodiscard]] nn::Result<void> read_kv(const nn::KeyValueRecord& kv) override;
+};
+
+// ── ModelSpec 往返（开放规格 + 旧格式只读兼容）───────────────────────────
 [[nodiscard]] nn::ModelSpec make_go_spec(const GoModelConfig& config);
 [[nodiscard]] bool is_go_spec(const nn::ModelSpec& spec) noexcept;
 [[nodiscard]] nn::Result<GoModelConfig> go_config_from_spec(const nn::ModelSpec& spec);
+[[nodiscard]] nn::Result<nn::ModelSpec> peek_go_model_spec(const std::string& path);
+[[nodiscard]] nn::Result<std::string> load_go_model(
+    const std::string& path,
+    nn::Model& model,
+    std::uint32_t* version_out = nullptr,
+    nn::ModelRole* role_out = nullptr,
+    nn::WeightLoadIntent intent = nn::WeightLoadIntent::Inference
+);
 
 // ── 工厂 ───────────────────────────────────────────────────────────────────
 [[nodiscard]] nn::Result<nn::Model> build_project_model(

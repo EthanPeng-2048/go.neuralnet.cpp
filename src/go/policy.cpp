@@ -96,7 +96,7 @@ PolicyPlayer PolicyPlayer::load(
     }
     std::shared_ptr<nn::ComputeEngine> engine = std::move(*engine_result);
 
-    const nn::ModelSpec spec = NN_UNWRAP(nn::peek_any_model_spec(model_path));
+    const nn::ModelSpec spec = NN_UNWRAP(go::peek_go_model_spec(model_path));
     nn::Model model = NN_UNWRAP(go::build_project_model_from_spec(*engine, spec));
     const std::size_t history_len =
         go::is_go_spec(spec) ? NN_UNWRAP(go::go_config_from_spec(spec)).history_len : 0;
@@ -108,7 +108,7 @@ PolicyPlayer PolicyPlayer::load(
         );
     }
     // load_model 返回内嵌 tokenizer 字节（本模型无分词器，忽略）。
-    const std::string tokenizer_bytes = NN_UNWRAP(nn::load_model(model_path, model));
+    const std::string tokenizer_bytes = NN_UNWRAP(go::load_go_model(model_path, model));
     (void)tokenizer_bytes;
     model.set_training(false);
 

@@ -6,6 +6,22 @@ semantic versioning once public model or data formats are declared stable.
 
 ## [Unreleased]
 
+### Changed
+
+- neuralnet.cpp submodule 升级 v1.12.0 → v1.14.1（开放规格 + 训练骨架，RFC 32）：
+  - Go 模型规格迁移到 `ModelSpecBase` 扩展点：新增 `GoTransformerSpec`
+    （类型名 `GoTransformer`，经 `ModelRegistry` 注册），替代 v1.13 扁平
+    `ModelSpec` 的 `layer_dims` 魔数方案；v1.13 及更早的 `.nnmodel`/`.nnckpt`
+    保留**只读**兼容层（识别 "GoM1" 标记 → 重写规格头到临时文件 → 走上游
+    载入路径），写出一律用新格式。
+  - 训练断点状态段适配 `TrainState` 虚基类化：`go_train_cli` 复用
+    `nn::TextTrainState` 承载计数器/配方/数据集身份（旧 Go 断点无
+    `state_kind` 键，读回即 text kind）；断点保存交给 `save_model` 内部的
+    `clone()` 快照，续训载入按 `unique_ptr<TrainState>` 下转型校验域类型。
+  - 项目内 `peek_any_model_spec`/`load_model` 调用点换成
+    `go::peek_go_model_spec`/`go::load_go_model`，保证旧格式文件经兼容层。
+  - 依赖基线（`DEPENDENCIES.md`）更新到 v1.14.1 tag/commit 与升级理由。
+
 ### Added
 
 - Parallel pipeline operations, with byte-identical output: `ingest` parses

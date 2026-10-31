@@ -16,6 +16,11 @@
 #include "go/go_model.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -52,64 +57,299 @@ void validate_config(const GoModelConfig& cfg) {
 
 }  // namespace
 
-// ── ModelSpec 往返（D6 零补丁）────────────────────────────────────────────
-nn::ModelSpec make_go_spec(const GoModelConfig& config) {
-    nn::ModelSpec spec;
-    spec.type = nn::ModelType::Transformer;
-    spec.d_model = config.d_model;
-    spec.num_heads = config.num_heads;
-    spec.d_ff = config.d_ff;
-    spec.num_layers = config.num_layers;
-    spec.patch_size = config.region_grid;
-    spec.vocab_size = policy_class_count;
-    spec.seq_len = go_total_tokens(config.history_len);
-    spec.pos_encoding = nn::PosEncodingType::Learned;
-    spec.activation = nn::ActivationType::GeLU;
-    spec.norm_type = nn::NormType::LayerNorm;
-    // 魔数 + 只属于 Go 的维度（Transformer 分支的 spec_matches 不比较它们，
-    // 但重建模型必需，且 is_go_spec 靠首元素识别）。
-    spec.layer_dims = {
+// ── ModelSpec 往返（neuralnet.cpp v1.14.1 开放规格）───────────────────────
+std::unique_ptr<nn::ModelSpecBase> GoTransformerSpec::clone() const {
+    return std::make_unique<GoTransformerSpec>(*this);
+}
+
+bool GoTransformerSpec::arch_compatible(
+    const nn::ModelSpecBase& other
+) const {
+    const auto* peer = dynamic_cast<const GoTransformerSpec*>(&other);
+    if (!peer) {
+        return false;
+    }
+    return config.d_model == peer->config.d_model &&
+           config.num_layers == peer->config.num_layers &&
+           config.num_heads == peer->config.num_heads &&
+           config.d_ff == peer->config.d_ff &&
+           config.conv_channels == peer->config.conv_channels &&
+           config.history_len == peer->config.history_len &&
+           config.history_vocab == peer->config.history_vocab &&
+           config.region_grid == peer->config.region_grid &&
+           config.cnn_policy == peer->config.cnn_policy;
+}
+
+std::string GoTransformerSpec::summary(const nn::ModelSpec&) const {
+    return "GoTransformer(d_model=" + std::to_string(config.d_model) +
+           ",layers=" + std::to_string(config.num_layers) +
+           ",heads=" + std::to_string(config.num_heads) +
+           ",d_ff=" + std::to_string(config.d_ff) +
+           ",conv=" + std::to_string(config.conv_channels) +
+           ",history=" + std::to_string(config.history_len) +
+           (config.cnn_policy ? ",cnn_policy=1" : "") + ")";
+}
+
+void GoTransformerSpec::write_kv(nn::KeyValueRecord& kv) const {
+    // 键名与 v1.13 的扁平规格保持一致，旧文件的 extra keys 可原样复用。
+    kv.set("d_model", static_cast<std::uint64_t>(config.d_model));
+    kv.set("num_heads", static_cast<std::uint64_t>(config.num_heads));
+    kv.set("d_ff", static_cast<std::uint64_t>(config.d_ff));
+    kv.set("num_layers", static_cast<std::uint64_t>(config.num_layers));
+    kv.set("patch_size", static_cast<std::uint64_t>(config.region_grid));
+    kv.set("vocab_size", static_cast<std::uint64_t>(policy_class_count));
+    kv.set("seq_len", static_cast<std::uint64_t>(go_total_tokens(config.history_len)));
+    kv.set("pos_encoding", static_cast<std::uint64_t>(nn::PosEncodingType::Learned));
+    kv.set("activation", static_cast<std::uint64_t>(nn::ActivationType::GeLU));
+    kv.set("norm_type", static_cast<std::uint64_t>(nn::NormType::LayerNorm));
+    kv.set("layer_dims", std::vector<std::uint64_t>{
         go_spec_tag,
         config.history_len,
         config.conv_channels,
         config.region_grid,
         config.history_vocab,
-        config.cnn_policy ? std::size_t{1} : std::size_t{0},
+        config.cnn_policy ? std::uint64_t{1} : std::uint64_t{0},
+    });
+}
+
+nn::Result<void> GoTransformerSpec::read_kv(const nn::KeyValueRecord& kv) {
+    auto require_u64 = [&kv](const char* key) -> nn::Result<std::uint64_t> {
+        std::uint64_t value = 0;
+        if (!kv.get(key, value)) {
+            NN_FAIL(std::string("GoTransformerSpec: 规格缺少键 '") + key + "'");
+        }
+        return value;
     };
+
+    NN_TRY(d_model_r, require_u64("d_model"));
+    NN_TRY(num_heads_r, require_u64("num_heads"));
+    NN_TRY(d_ff_r, require_u64("d_ff"));
+    NN_TRY(num_layers_r, require_u64("num_layers"));
+    NN_TRY(patch_size_r, require_u64("patch_size"));
+    NN_TRY(vocab_size_r, require_u64("vocab_size"));
+    NN_TRY(seq_len_r, require_u64("seq_len"));
+    const std::uint64_t d_model = *d_model_r;
+    const std::uint64_t num_heads = *num_heads_r;
+    const std::uint64_t d_ff = *d_ff_r;
+    const std::uint64_t num_layers = *num_layers_r;
+    const std::uint64_t patch_size = *patch_size_r;
+    const std::uint64_t vocab_size = *vocab_size_r;
+    const std::uint64_t seq_len = *seq_len_r;
+
+    std::vector<std::uint64_t> dims;
+    if (!kv.get("layer_dims", dims) || dims.size() < 5 ||
+        dims[0] != go_spec_tag) {
+        NN_FAIL("GoTransformerSpec: layer_dims 缺少 GoM1 标记或 Go 维度");
+    }
+    if (vocab_size != policy_class_count) {
+        NN_FAIL("GoTransformerSpec: vocab_size 必须是 362");
+    }
+    if (patch_size != region_grid || dims[3] != region_grid) {
+        NN_FAIL("GoTransformerSpec: region_grid 固定为 5（19×19 特化）");
+    }
+    if (d_model == 0 || num_heads == 0 || d_ff == 0 || num_layers == 0 ||
+        d_model % num_heads != 0) {
+        NN_FAIL("GoTransformerSpec: Transformer 维度非法");
+    }
+
+    config.d_model = static_cast<std::size_t>(d_model);
+    config.num_heads = static_cast<std::size_t>(num_heads);
+    config.d_ff = static_cast<std::size_t>(d_ff);
+    config.num_layers = static_cast<std::size_t>(num_layers);
+    config.conv_channels = static_cast<std::size_t>(dims[2]);
+    config.history_len = static_cast<std::size_t>(dims[1]);
+    config.history_vocab = static_cast<std::size_t>(dims[4]);
+    config.region_grid = static_cast<std::size_t>(dims[3]);
+    config.cnn_policy = dims.size() >= 6 && dims[5] != 0;
+
+    if (config.conv_channels == 0 || config.history_len == 0 ||
+        config.history_vocab < history_vocab_size) {
+        NN_FAIL("GoTransformerSpec: Go 模型维度非法");
+    }
+    if (seq_len != go_total_tokens(config.history_len)) {
+        NN_FAIL("GoTransformerSpec: seq_len 与 history_len 不自洽");
+    }
+    return {};
+}
+
+[[maybe_unused]] const bool register_go_transformer_spec = [] {
+    nn::ModelRegistry::instance().register_type(
+        "GoTransformer", [] { return std::make_unique<GoTransformerSpec>(); }
+    );
+    return true;
+}();
+
+nn::ModelSpec make_go_spec(const GoModelConfig& config) {
+    nn::ModelSpec spec;
+    auto& arch = spec.emplace<GoTransformerSpec>();
+    arch.config = config;
     return spec;
 }
 
 bool is_go_spec(const nn::ModelSpec& spec) noexcept {
-    return spec.is_transformer() && !spec.layer_dims.empty() &&
-           spec.layer_dims[0] == go_spec_tag;
+    return spec.as<GoTransformerSpec>() != nullptr;
 }
 
 nn::Result<GoModelConfig> go_config_from_spec(const nn::ModelSpec& spec) {
-    if (!is_go_spec(spec)) {
-        NN_FAIL("go_config_from_spec: 该 spec 不描述 Go 模型（缺 GoM1 标记）");
+    const auto* arch = spec.as<GoTransformerSpec>();
+    if (!arch) {
+        NN_FAIL("go_config_from_spec: 该 spec 不描述 Go 模型");
     }
-    if (spec.layer_dims.size() < 5) {
-        NN_FAIL("go_config_from_spec: layer_dims 缺少 Go 维度（需要 5 项）");
+    return arch->config;
+}
+
+// ── v1.13 及更早规格的只读兼容层 ──────────────────────────────────────────
+namespace {
+
+struct LegacyGoSpecHeader {
+    bool is_go = false;
+    std::uint32_t version = 0;
+    std::size_t spec_end = 0;
+    nn::ModelSpec spec;
+};
+
+nn::Result<LegacyGoSpecHeader> read_legacy_go_spec_header(const std::string& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        NN_FAIL("Cannot open file for reading: " + path);
     }
-    GoModelConfig config;
-    config.d_model = spec.d_model;
-    config.num_heads = spec.num_heads;
-    config.d_ff = spec.d_ff;
-    config.num_layers = spec.num_layers;
-    config.region_grid = spec.layer_dims[3];
-    config.history_len = spec.layer_dims[1];
-    config.conv_channels = spec.layer_dims[2];
-    config.history_vocab = spec.layer_dims[4];
-    // 第 6 项是后加的（旧断点/模型没有它）→ 缺省视为关闭。
-    config.cnn_policy = spec.layer_dims.size() >= 6 && spec.layer_dims[5] != 0;
-    // 交叉校验：seq_len 必须与 K 自洽（防止手工改过的 spec 静默错位）。
-    if (spec.seq_len != go_total_tokens(config.history_len)) {
-        NN_FAIL("go_config_from_spec: seq_len 与 history_len 不自洽");
+    nn::ModelRole role = nn::ModelRole::Model;
+    NN_TRY(version, nn::detail::read_and_validate_header(input, &role));
+    NN_TRY(spec_len, nn::detail::read_bytes<std::uint64_t>(input));
+    if (*spec_len > 64u * 1024u * 1024u) {
+        NN_FAIL("规格头长度越界（超过 64 MiB）: " + path);
     }
-    if (spec.vocab_size != policy_class_count) {
-        NN_FAIL("go_config_from_spec: vocab_size 必须是 362");
+    std::string bytes(static_cast<std::size_t>(*spec_len), '\0');
+    if (!bytes.empty()) {
+        input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        if (!input) {
+            NN_FAIL("Unexpected end while reading spec header: " + path);
+        }
     }
-    return config;
+    const auto pos = input.tellg();
+    if (pos < 0) {
+        NN_FAIL("Cannot determine spec header end: " + path);
+    }
+
+    NN_TRY(kv, nn::KeyValueRecord::parse(bytes));
+    LegacyGoSpecHeader out;
+    out.version = *version;
+    out.spec_end = static_cast<std::size_t>(pos);
+
+    std::string type_name;
+    std::uint64_t type_number = 0;
+    const bool legacy_transformer =
+        (!kv->get("type", type_name) && kv->get("type", type_number) &&
+         type_number == static_cast<std::uint64_t>(nn::ModelType::Transformer)) ||
+        type_name == "Transformer";
+    std::vector<std::uint64_t> dims;
+    if (!legacy_transformer || !kv->get("layer_dims", dims) || dims.empty() ||
+        dims[0] != go_spec_tag) {
+        return out;
+    }
+
+    out.spec.emplace<GoTransformerSpec>();
+    NN_TRY_CHECK(out.spec.arch->read_kv(*kv));
+    NN_TRY_CHECK(go_config_from_spec(out.spec));
+    out.is_go = true;
+    return out;
+}
+
+nn::Result<std::string> make_legacy_upgrade_path(const std::string& source) {
+    std::error_code error;
+    const auto directory = std::filesystem::temp_directory_path(error);
+    if (error) {
+        NN_FAIL("无法确定临时目录以兼容旧 Go 模型文件: " + error.message());
+    }
+    static std::atomic<std::uint64_t> counter{0};
+    const auto suffix = std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+    return (directory / ("go_neuralnet_v1_14_1_" + suffix +
+                         std::filesystem::path(source).extension().string()))
+        .string();
+}
+
+nn::Result<std::string> write_legacy_upgrade(
+    const std::string& source, const LegacyGoSpecHeader& header
+) {
+    std::ifstream input(source, std::ios::binary | std::ios::ate);
+    if (!input) {
+        NN_FAIL("Cannot open file for reading: " + source);
+    }
+    const auto end = input.tellg();
+    if (end < 0) {
+        NN_FAIL("Cannot determine file size: " + source);
+    }
+    const auto tail_size = header.version >= 8 ? nn::MODEL_TAIL_BYTES : 0;
+    const auto total = static_cast<std::size_t>(end);
+    if (total < header.spec_end + tail_size) {
+        NN_FAIL("模型文件过小或规格头截断: " + source);
+    }
+    std::string content(total, '\0');
+    input.seekg(0, std::ios::beg);
+    input.read(content.data(), static_cast<std::streamsize>(content.size()));
+    if (!input) {
+        NN_FAIL("Read error while reading model file: " + source);
+    }
+
+    const auto new_spec = nn::detail::spec_to_kv(header.spec).serialize();
+    const auto new_len = static_cast<std::uint64_t>(new_spec.size());
+    std::ostringstream output(std::ios::binary);
+    output.write(content.data(), static_cast<std::streamsize>(18));
+    output.write(reinterpret_cast<const char*>(&new_len), sizeof(new_len));
+    output.write(new_spec.data(), static_cast<std::streamsize>(new_spec.size()));
+    const auto payload_size = total - header.spec_end - tail_size;
+    output.write(
+        content.data() + header.spec_end, static_cast<std::streamsize>(payload_size)
+    );
+
+    std::string upgraded = output.str();
+    if (header.version >= 8) {
+        nn::detail::Sha256State hasher;
+        nn::detail::sha256_update(hasher, upgraded);
+        const auto digest = nn::detail::sha256_finalize(hasher);
+        upgraded.append(reinterpret_cast<const char*>(digest.data()), digest.size());
+        upgraded.append(nn::MODEL_TAIL_MAGIC.data(), nn::MODEL_TAIL_MAGIC.size());
+    }
+
+    NN_TRY(destination, make_legacy_upgrade_path(source));
+    std::ofstream output_file(*destination, std::ios::binary | std::ios::trunc);
+    if (!output_file) {
+        NN_FAIL("Cannot open temporary compatibility file for writing: " + *destination);
+    }
+    output_file.write(
+        upgraded.data(), static_cast<std::streamsize>(upgraded.size())
+    );
+    if (!output_file) {
+        NN_FAIL("Write error while creating compatibility file: " + *destination);
+    }
+    return *std::move(destination);
+}
+
+}  // namespace
+
+nn::Result<nn::ModelSpec> peek_go_model_spec(const std::string& path) {
+    NN_TRY(legacy, read_legacy_go_spec_header(path));
+    if (legacy->is_go) {
+        return std::move(legacy->spec);
+    }
+    return nn::peek_any_model_spec(path);
+}
+
+nn::Result<std::string> load_go_model(
+    const std::string& path, nn::Model& model, std::uint32_t* version_out,
+    nn::ModelRole* role_out, nn::WeightLoadIntent intent
+) {
+    NN_TRY(legacy, read_legacy_go_spec_header(path));
+    if (!legacy->is_go) {
+        return nn::load_model(path, model, version_out, role_out, intent);
+    }
+
+    NN_TRY(upgraded, write_legacy_upgrade(path, *legacy));
+    auto loaded = nn::load_model(*upgraded, model, version_out, role_out, intent);
+    std::error_code error;
+    std::filesystem::remove(*upgraded, error);
+    NN_TRY_CHECK(loaded);
+    return *std::move(loaded);
 }
 
 // ── 工厂 ───────────────────────────────────────────────────────────────────

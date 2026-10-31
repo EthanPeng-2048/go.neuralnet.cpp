@@ -66,8 +66,11 @@ void test_spec_roundtrip() {
 
     const nn::ModelSpec spec = go::make_go_spec(config);
     require(go::is_go_spec(spec), "make_go_spec output must be recognized");
-    require_eq(spec.seq_len, go::go_total_tokens(12), "spec.seq_len = T");
-    require_eq(spec.patch_size, go::region_grid, "spec.patch_size = region grid");
+    const auto* arch = spec.as<go::GoTransformerSpec>();
+    require(arch != nullptr, "Go spec uses the v1.14 open specification type");
+    require(std::string(arch->type_name()) == "GoTransformer",
+            "spec.type_name = GoTransformer");
+    require_eq(arch->config.region_grid, go::region_grid, "spec region grid");
 
     const go::GoModelConfig restored = NN_UNWRAP(go::go_config_from_spec(spec));
     require_eq(restored.d_model, config.d_model, "roundtrip d_model");
@@ -80,14 +83,12 @@ void test_spec_roundtrip() {
     // 外来 Transformer spec（无 Go 标记）必须被拒绝，否则会拿 Go 维度去
     // 构造一个语义完全不同的模型。
     nn::ModelSpec foreign;
-    foreign.type = nn::ModelType::Transformer;
-    foreign.d_model = 48;
-    foreign.num_heads = 4;
-    foreign.d_ff = 96;
-    foreign.num_layers = 3;
-    foreign.patch_size = 4;
-    foreign.vocab_size = 10;
-    foreign.seq_len = 16;
+    auto& transformer = foreign.emplace<nn::TransformerSpec>();
+    transformer.d_model = 48;
+    transformer.num_heads = 4;
+    transformer.d_ff = 96;
+    transformer.num_layers = 3;
+    transformer.patch_size = 4;
     require(!go::is_go_spec(foreign), "foreign Transformer spec must not pass");
 }
 

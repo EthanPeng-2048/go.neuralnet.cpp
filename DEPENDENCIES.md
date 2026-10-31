@@ -1,6 +1,6 @@
 # 第三方依赖基线
 
-> 状态：**已锁定**（2026-10-24）
+> 状态：**已锁定**（2026-10-31）
 > 本文件是 go.neuralnet.cpp 第三方依赖版本的唯一真源。修改依赖前先更新本文件，
 > 再同步路线图与设计文档。
 
@@ -9,10 +9,10 @@
 | 项目 | 值 |
 |---|---|
 | 上游仓库 | <https://github.com/EthanPeng-2048/neuralnet.cpp> |
-| 正式引用 | [`v1.12.0`](https://github.com/EthanPeng-2048/neuralnet.cpp/tree/v1.12.0) |
-| annotated tag object | `e8cae9b4031f9427e36f8557f7382b0594bd5200` |
-| tag 指向提交 | `05c78eaf6eb994981204dca9434febc0c447c6a5` |
-| 发布提交时间 | `2026-10-23T23:55:23+08:00` |
+| 正式引用 | [`v1.14.1`](https://github.com/EthanPeng-2048/neuralnet.cpp/tree/v1.14.1) |
+| annotated tag object | `9ec96e3f11ceedeb57c04c4c9509bbaed549c7d3` |
+| tag 指向提交 | `08cf4453973d93b9cad661eb9fa87fed415a4839` |
+| 发布提交时间 | `2026-10-31T14:54:04+08:00` |
 | 许可证 | **LGPL-3.0**（v1.12.0 起；v1.11.0 及以前为 MIT） |
 | 消费入口 | `neuralnet::nn` |
 | 聚合头 | `<neuralnet.cpp/nn.hpp>`；RL-only 入口为 `<neuralnet.cpp/rl.hpp>` |
@@ -34,13 +34,24 @@ add_subdirectory(3rd_party/neuralnet.cpp)
 target_link_libraries(my_app PRIVATE neuralnet::nn)
 ```
 
-Windows 项目侧兼容：`go_train_cli` 链接 8 MiB 栈。neuralnet.cpp v1.12.0 的流式
+Windows 项目侧兼容：`go_train_cli` 链接 8 MiB 栈。neuralnet.cpp 的流式
 SHA-256 使用 1 MiB 栈缓冲，而 Windows 默认线程栈约 1 MiB；该设置只解决模型
 完整性校验的栈溢出，不修改 submodule 源码。
 
-## 为什么锁定 v1.12.0
+## 为什么锁定 v1.14.1
 
-- v1.12.0 正式发布 RL 与可组合训练基础设施；此前“等上游 RL 原语”的阻塞已解除。
+- v1.14.0 发布训练骨架与开放规格（RFC 32）：`TrainState` 虚基类化（域子类挂
+  `state_kind`/`write_extra_kv`/`read_extra_kv`/`verify_extra` 钩子）、
+  `ModelSpec` 多态化（`ModelSpecBase` + `ModelRegistry` 自定义类型注册）、
+  `BatchSource`/`RunDriver`/`TrainingSession::save_checkpoint/resume` 一站式
+  断点编排；v1.14.1 修复断点续训的半提交与优化器 `t` 权威值。
+- 项目侧迁移：Go 模型规格改为 `GoTransformerSpec : nn::ModelSpecBase`
+  （类型名 `GoTransformer`，经 `ModelRegistry` 注册），保留 v1.13 及更早扁平
+  Transformer 规格的只读兼容层；训练状态段复用 `nn::TextTrainState` 承载数据
+  集身份（旧 Go 断点无 `state_kind` 键，读回即 text kind，与上游工厂口径一致）。
+- v1.12.0 奠定的 RL 与可组合训练基础设施（具名多输出、schema 化 experience、
+  GAE/return/group normalization、REINFORCE/PPO/GRPO objectives、
+  `TrainingGroupSession` 与 `RLTrainingPipeline`）保持可用。
 - 可用的公共能力包括具名多输出、schema 化 experience、GAE/return/group
   normalization、REINFORCE/PPO/GRPO objectives、`TrainingGroupSession` 与
   `RLTrainingPipeline`。
@@ -58,8 +69,9 @@ SHA-256 使用 1 MiB 栈缓冲，而 Windows 默认线程栈约 1 MiB；该设�
 4. `3rd_party/neuralnet.cpp` 的检出提交必须等于本表的 peeled commit；父仓库只记录
    gitlink，不把上游源码重复提交进本仓库。
 
-依据：[v1.12.0 release notes](https://github.com/EthanPeng-2048/neuralnet.cpp/blob/v1.12.0/docs/release-notes/v1.12.0.md)、
-[RL 使用指南](https://github.com/EthanPeng-2048/neuralnet.cpp/blob/v1.12.0/docs/usage/06-reinforcement-learning.md)。
+依据：[v1.14.0 release notes](https://github.com/EthanPeng-2048/neuralnet.cpp/blob/v1.14.0/docs/release-notes/v1.14.0.md)、
+[v1.12.0 release notes](https://github.com/EthanPeng-2048/neuralnet.cpp/blob/v1.12.0/docs/release-notes/v1.12.0.md)、
+[RL 使用指南](https://github.com/EthanPeng-2048/neuralnet.cpp/blob/v1.14.0/docs/usage/06-reinforcement-learning.md)。
 
 ## KataGo（M1 棋规库）
 

@@ -687,7 +687,7 @@ void load_weights(
         );
     }
     std::cerr << "model file verified\n";
-    auto result = nn::load_model(path, model, nullptr, nullptr, intent);
+    auto result = go::load_go_model(path, model, nullptr, nullptr, intent);
     if (!result) {
         throw std::runtime_error(
             "cannot load model '" + path + "': " + result.error().message
@@ -698,7 +698,10 @@ void load_weights(
 // ── M5 断点状态装配 ─────────────────────────────────────────────────────
 // 计数器 = 续训起点；配方 = 曲线形状与优化器身份（续训以断点为权威）；
 // 数据集身份 = .ngf 文件 sha256 + 样本数（内容变了就不存在正确的续训语义）。
-nn::TrainState make_train_state(
+// Go 训练器复用上游 TextTrainState 承载域字段（state_kind="text"）：旧 Go
+// 断点（v1.13 无 state_kind 键）读回即 text kind，且上游工厂不接受自定义
+// kind —— 数据集身份（.ngf sha256 + 样本数）正好落在 DatasetIdentity。
+nn::TextTrainState make_train_state(
     const TrainOptions& options,
     const nn::TrainingSession& session,
     std::uint64_t completed_epochs,
@@ -706,7 +709,7 @@ nn::TrainState make_train_state(
     const std::string& dataset_sha256,
     std::size_t train_samples
 ) {
-    nn::TrainState state;
+    nn::TextTrainState state;
     state.counters.global_step = global_step_base + session.step_count();
     state.counters.epoch = completed_epochs;
     state.counters.step_in_epoch = 0;  // 断点只写在 epoch 边界
@@ -747,9 +750,8 @@ void save_checkpoint_file(
 ) {
     std::vector<nn::Tensor> blobs;
     NN_UNWRAP(optimizer.save_state(blobs));
-    nn::TrainState with_count = state;
-    with_count.optimizer_blob_count = blobs.size();
-    const nn::CheckpointState ckpt{&with_count, std::span<const nn::Tensor>(blobs)};
+    // save_model 内部 clone 状态并回写 optimizer_blob_count，调用方只给只读引用。
+    const nn::CheckpointState ckpt{&state, std::span<const nn::Tensor>(blobs)};
     NN_UNWRAP(nn::save_model(
         path, model, spec, {}, nn::ModelRole::Checkpoint, ckpt
     ));
@@ -823,41 +825,47 @@ int train(const TrainOptions& options) {
     if (!options.resume.empty()) {
         // ── 断点续训：状态段为唯一权威 ────────────────────────────────
         nn::LoadedTrainState loaded = NN_UNWRAP(nn::load_train_state(engine, options.resume));
-        const nn::TrainState& saved = loaded.state;
+        const auto* saved = dynamic_cast<const nn::TextTrainState*>(loaded.state.get());
+        if (saved == nullptr) {
+            throw std::runtime_error(
+                std::string("--resume 的训练状态段不是 Go 训练器可识别的类型（kind=") +
+                loaded.state->state_kind() + "）: " + options.resume
+            );
+        }
 
         // 数据集身份门禁（硬错）：sha256 或样本数变了 ⇒ step 号 / lr 曲线
         // 语义全变，续训不存在正确出口。
-        if (saved.dataset.sha256 != dataset_sha256 ||
-            saved.dataset.num_samples != train_cache.size()) {
+        if (saved->dataset.sha256 != dataset_sha256 ||
+            saved->dataset.num_samples != train_cache.size()) {
             throw std::runtime_error(
                 std::string("--resume 的数据集与断点不一致（内容身份变了 ⇒ 续训不存在正确语义）:\n") +
-                "  断点记录 sha256=" + saved.dataset.sha256 +
-                " samples=" + std::to_string(saved.dataset.num_samples) + "\n" +
+                "  断点记录 sha256=" + saved->dataset.sha256 +
+                " samples=" + std::to_string(saved->dataset.num_samples) + "\n" +
                 "  本次     sha256=" + dataset_sha256 +
                 " samples=" + std::to_string(train_cache.size()) + "\n" +
                 "  断点文件: " + options.resume + "\n" +
                 "  换数据集 = 新任务 ⇒ 请从推理模型（.nnmodel）重开一轮"
             );
         }
-        if (saved.recipe.epochs != static_cast<std::uint64_t>(options.epochs)) {
+        if (saved->recipe.epochs != static_cast<std::uint64_t>(options.epochs)) {
             throw std::runtime_error(
                 "--epochs 与断点配方不一致（lr 曲线形状必须跨续训不变）: 断点 epochs=" +
-                std::to_string(saved.recipe.epochs) + "，本次 --epochs " +
+                std::to_string(saved->recipe.epochs) + "，本次 --epochs " +
                 std::to_string(options.epochs)
             );
         }
-        if (saved.recipe.accum_steps != 1) {
+        if (saved->recipe.accum_steps != 1) {
             throw std::runtime_error("本训练器只支持 accum_steps=1 的断点");
         }
-        if (saved.counters.epoch > static_cast<std::uint64_t>(options.epochs)) {
+        if (saved->counters.epoch > static_cast<std::uint64_t>(options.epochs)) {
             throw std::runtime_error(
-                "断点已训完 " + std::to_string(saved.counters.epoch) +
+                "断点已训完 " + std::to_string(saved->counters.epoch) +
                 " 个 epoch，超过 --epochs " + std::to_string(options.epochs) +
                 "，没有可续的训练"
             );
         }
 
-        const nn::ModelSpec file_spec = NN_UNWRAP(nn::peek_any_model_spec(options.resume));
+        const nn::ModelSpec file_spec = NN_UNWRAP(go::peek_go_model_spec(options.resume));
         model = std::make_unique<nn::Model>(
             NN_UNWRAP(go::build_project_model_from_spec(engine, file_spec))
         );
@@ -877,11 +885,11 @@ int train(const TrainOptions& options) {
             require_history_k(history_len);
         }
 
-        global_step_base = saved.counters.global_step;
-        start_epoch = static_cast<int>(saved.counters.epoch);
+        global_step_base = saved->counters.global_step;
+        start_epoch = static_cast<int>(saved->counters.epoch);
         const std::size_t optimizer_tensors = loaded.optimizer_blobs.size();
-        const std::uint64_t optimizer_step = saved.optimizer_step;
-        const std::string optimizer_name = saved.recipe.optimizer;
+        const std::uint64_t optimizer_step = saved->optimizer_step;
+        const std::string optimizer_name = saved->recipe.optimizer;
         resumed = std::move(loaded);
         std::cerr << "resumed from " << options.resume
                   << ": epoch=" << start_epoch
@@ -947,7 +955,7 @@ int train(const TrainOptions& options) {
 
     if (resumed) {
         // 优化器身份已由状态段决定；张量数量/形状对不上由 load_state 硬错。
-        session.optimizer().set_state_step(resumed->state.optimizer_step);
+        session.optimizer().set_state_step(resumed->state->optimizer_step);
         NN_UNWRAP(session.optimizer().load_state(resumed->optimizer_blobs));
         std::cerr << "restored optimizer state: "
                   << resumed->optimizer_blobs.size() << " tensors\n";
@@ -1181,7 +1189,7 @@ int train(const TrainOptions& options) {
     NN_UNWRAP(nn::save_model(options.model, session.model(), spec));
 
     const nn::ModelSpec loaded_checkpoint_spec =
-        NN_UNWRAP(nn::peek_any_model_spec(options.checkpoint));
+        NN_UNWRAP(go::peek_go_model_spec(options.checkpoint));
     nn::Model checkpoint_model =
         NN_UNWRAP(go::build_project_model_from_spec(engine, loaded_checkpoint_spec));
     load_weights(options.checkpoint, checkpoint_model, nn::WeightLoadIntent::Inference);
@@ -1191,7 +1199,7 @@ int train(const TrainOptions& options) {
     );
 
     const nn::ModelSpec loaded_model_spec =
-        NN_UNWRAP(nn::peek_any_model_spec(options.model));
+        NN_UNWRAP(go::peek_go_model_spec(options.model));
     nn::Model inference_model =
         NN_UNWRAP(go::build_project_model_from_spec(engine, loaded_model_spec));
     load_weights(options.model, inference_model, nn::WeightLoadIntent::Inference);
@@ -1366,7 +1374,7 @@ int evaluate_cli(const EvalOptions& options) {
     go::FeatureCache cache = go::FeatureCache::open(options.dataset);
     std::shared_ptr<nn::ComputeEngine> engine_ptr = create_engine(options.common);
     nn::ComputeEngine& engine = *engine_ptr;
-    const nn::ModelSpec spec = NN_UNWRAP(nn::peek_any_model_spec(options.model));
+    const nn::ModelSpec spec = NN_UNWRAP(go::peek_go_model_spec(options.model));
     std::cerr << "loaded model spec: " << nn::spec_summary(spec) << '\n';
     nn::Model model = NN_UNWRAP(go::build_project_model_from_spec(engine, spec));
     const std::size_t history_len =
